@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: auction-board
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --preload --workers=2 --threads=8 --timeout=120
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FLASK_SECRET
+        sync: false
+      - key: VIEW_TOKEN
+        sync: false
+      - key: MAX_UPLOAD_MB
+        sync: false
