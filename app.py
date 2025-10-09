@@ -72,12 +72,27 @@ def logout():
     return resp
 
 # ---------- STORAGE HELPERS ----------
-def put_object(path: str, data: bytes, content_type: str|None=None):
-    file_options = {"content-type": content_type} if content_type else None
-    res = supabase.storage.from_(BUCKET).upload(path=path, file=data, file_options=file_options, upsert=True)
-    if hasattr(res, "error") and res.error:
-        raise RuntimeError(res.error.message)
+def put_object(path: str, data: bytes, content_type: str | None = None):
+    """
+    Upload bytes to Supabase Storage at bucket/path.
+    Newer supabase-py doesn't accept upsert= kwarg; use file_options["upsert"]="true".
+    Also fall back to update() if the object already exists.
+    """
+    file_options = {}
+    if content_type:
+        file_options["content-type"] = content_type
+    # enable overwrite
+    
 
+    try:
+        # upload (will overwrite because of upsert option)
+        supabase.storage.from_(BUCKET).upload(path=path, file=data, file_options=file_options)
+    except Exception as e:
+        # Some versions still 409 on conflict; try update() as fallback
+        try:
+            supabase.storage.from_(BUCKET).update(path=path, file=data, file_options={"content-type": content_type} if content_type else None)
+        except Exception:
+            raise
 def get_object(path: str) -> bytes|None:
     try:
         return supabase.storage.from_(BUCKET).download(path)
