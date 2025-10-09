@@ -1,5 +1,6 @@
 import os, io, json, zipfile, mimetypes, csv
 import pandas as pd
+from flask import jsonify
 from datetime import datetime
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
@@ -13,14 +14,14 @@ IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 MAX_IMAGE_NUM = 120
 
 # Storage bucket and object layout
-BUCKET     = "auction"
-PLAYERS_XLS= "Players.xls"               # columns: PlayerNo, PlayerName
-TEAM_XLS   = "Teamnames.xls"             # column: TeamName
-TEAM_COL   = "TeamName"
-STATE_JSON = "auction_state.json"
-IMAGES_DIR = "images"                    # e.g., images/12.jpg
+BUCKET      = "auction"
+PLAYERS_XLS = "Players.xlsx"               # Preferred; will fall back to Players.xls automatically
+TEAM_XLS    = "Teamnames.xlsx"             # Preferred; will fall back to Teamnames.xls
+TEAM_COL    = "TeamName"
+STATE_JSON  = "auction_state.json"
+IMAGES_DIR  = "images"                     # e.g., images/12.jpg
 
-# ---------- ENV (Render → Environment) ----------
+# ---------- ENV (Render ? Environment) ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")   # service role key (server only)
 FLASK_SECRET = os.environ.get("FLASK_SECRET", "change-me")
@@ -31,6 +32,105 @@ MAX_UPLOAD_MB= int(os.environ.get("MAX_UPLOAD_MB", "50"))        # per request c
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- globals (place near your other globals) ---
+PLAYERS_DF = None
+PLAYERS_LAST_ERROR = None
+PLAYERS_SOURCE = None
+
+def _try_read_excel(path):
+    """Helper: read xlsx/xls if file exists; return (df or None, error or None)."""
+    if not os.path.exists(path):
+        return None, f"not found: {path}"
+    try:
+        if path.lower().endswith(".xlsx"):
+            df = pd.read_excel(path, engine="openpyxl")
+        else:
+            # xlrd only supports .xls (and must be <=1.2.0). Prefer .xlsx overall.
+            df = pd.read_excel(path, engine="xlrd")
+        return df, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+def load_players_sheet():
+    """
+    Try common locations/names. Require columns: PlayerNo, PlayerName.
+    Sets globals: PLAYERS_DF, PLAYERS_LAST_ERROR, PLAYERS_SOURCE.
+    """
+    global PLAYERS_DF, PLAYERS_LAST_ERROR, PLAYERS_SOURCE
+    PLAYERS_DF = None
+    PLAYERS_LAST_ERROR = None
+    PLAYERS_SOURCE = None
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, "Players.xlsx"),
+        os.path.join(base, "Players.xls"),
+        os.path.join(base, "static", "images", "Players.xlsx"),
+        os.path.join(base, "static", "images", "Players.xls"),
+    ]
+
+    tried = []
+    for p in candidates:
+        df, err = _try_read_excel(p)
+        tried.append({"path": p, "ok": err is None, "err": err})
+        if err is None:
+            # Normalize headers
+            cols = {c.strip(): c for c in df.columns}
+            if "PlayerNo" in cols and "PlayerName" in cols:
+                # Keep only the needed columns; coerce types sensibly
+                df = df.rename(columns={cols["PlayerNo"]: "PlayerNo",
+                                        cols["PlayerName"]: "PlayerName"})
+                # Make PlayerNo int-like if possible
+                try:
+                    df["PlayerNo"] = pd.to_numeric(df["PlayerNo"], errors="coerce").astype("Int64")
+                except Exception:
+                    pass
+                PLAYERS_DF = df
+                PLAYERS_SOURCE = p
+                PLAYERS_LAST_ERROR = None
+                break
+            else:
+                PLAYERS_LAST_ERROR = "Missing required columns: PlayerNo, PlayerName"
+                PLAYERS_DF = None
+
+    if PLAYERS_DF is None and PLAYERS_LAST_ERROR is None:
+        # nothing loaded; report everything we tried
+        PLAYERS_LAST_ERROR = f"Could not load any candidate file. Tried: {json.dumps(tried)}"
+
+# Call once on startup (optional)
+try:
+    load_players_sheet()
+except Exception as _e:
+    PLAYERS_LAST_ERROR = f"Startup load error: {_e}"
+
+@app.route("/api/diag", methods=["GET"])
+def api_diag():
+    """Report whether the players sheet is loaded and show a preview."""
+    global PLAYERS_DF, PLAYERS_LAST_ERROR, PLAYERS_SOURCE
+    loaded = PLAYERS_DF is not None and len(PLAYERS_DF) > 0
+    head = []
+    if loaded:
+        sample = PLAYERS_DF.head(5)[["PlayerNo", "PlayerName"]].astype(str).to_dict(orient="records")
+        head = sample
+    return jsonify({
+        "loaded": loaded,
+        "row_count": 0 if PLAYERS_DF is None else int(len(PLAYERS_DF)),
+        "columns": [] if PLAYERS_DF is None else list(PLAYERS_DF.columns.astype(str)),
+        "source_path": PLAYERS_SOURCE,
+        "last_error": PLAYERS_LAST_ERROR,
+        "first_rows": head
+    })
+
+@app.route("/api/reload", methods=["POST", "GET"])
+def api_reload():
+    """Force reload the Excel (useful after you upload/replace the file)."""
+    try:
+        load_players_sheet()
+        ok = PLAYERS_DF is not None and len(PLAYERS_DF) > 0
+        return jsonify({"reloaded": True, "loaded": ok, "row_count": 0 if not ok else int(len(PLAYERS_DF)), "error": PLAYERS_LAST_ERROR})
+    except Exception as e:
+        return jsonify({"reloaded": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 # ---------- AUTH ----------
 def _authed(): return request.cookies.get("auth") == "ok"
@@ -45,7 +145,7 @@ LOGIN_FORM = """
   button{background:#2563eb;color:#fff;padding:10px;border:none;border-radius:8px;font-weight:600;cursor:pointer;width:100%}
 </style></head><body>
   <div class="box">
-    <h2>🔒 Login</h2>
+    <h2>?? Login</h2>
     <form method="POST">
       <input name="username" placeholder="User ID" required>
       <input name="password" type="password" placeholder="Password" required>
@@ -76,10 +176,8 @@ def put_object(path: str, data: bytes, content_type: str | None = None):
     """Upload bytes to Supabase Storage. If the object exists, overwrite with update()."""
     file_options = {"content-type": content_type} if content_type else None
     try:
-        # no 'upsert' anywhere; just try upload
         supabase.storage.from_(BUCKET).upload(path=path, file=data, file_options=file_options)
     except Exception:
-        # if upload fails because file exists or any client quirk, try update()
         supabase.storage.from_(BUCKET).update(path=path, file=data, file_options=file_options)
 
 def get_object(path: str) -> bytes|None:
@@ -91,16 +189,12 @@ def get_object(path: str) -> bytes|None:
 def sign_url(path: str, expires_sec: int = 3600) -> str|None:
     try:
         res = supabase.storage.from_(BUCKET).create_signed_url(path, expires_sec)
-        # SDKs vary: 'signedURL' vs 'signed_url'
         return res.get("signedURL") or res.get("signed_url") or None
     except Exception:
         return None
 
 def list_images(prefix: str = "", limit: int = 50):
-    """
-    List image names under images/ that start with <prefix>.
-    Supabase list is folder-like: we list IMAGES_DIR and filter client-side.
-    """
+    """List image names under images/ that start with <prefix>."""
     try:
         entries = supabase.storage.from_(BUCKET).list(path=IMAGES_DIR, limit=1000)
         names = [e["name"] for e in entries if isinstance(e, dict) and "name" in e]
@@ -118,46 +212,88 @@ def _enforce_upload_size(request_obj):
         abort(413, f"Upload too large. Max {MAX_UPLOAD_MB} MB per request.")
 
 # ---------- DATA: Players / Teams / State ----------
-_df_cache = None
+import io as _io
+
+def _read_excel_bytes(data: bytes, filename: str):
+    """Read Excel bytes, supporting .xlsx (openpyxl) and .xls (requires xlrd==1.2.0)."""
+    name = filename.lower()
+    if name.endswith(".xls"):
+        # .xls needs xlrd 1.2.0
+        return pd.read_excel(_io.BytesIO(data), engine="xlrd")
+    # .xlsx (default engine)
+    return pd.read_excel(_io.BytesIO(data))
+
+# ---- Players (robust loader + cache)
+_df_players_cache = None
+
 def read_players_df():
-    global _df_cache
-    data = get_object(PLAYERS_XLS)
-    if not data:
-        _df_cache = None
-        return None
-    try:
-        _df_cache = pd.read_excel(io.BytesIO(data))
-        return _df_cache
-    except Exception as e:
-        print("Players.xls read error:", e)
-        _df_cache = None
-        return None
+    """Try Players.xlsx, then Players.xls; normalize columns & types."""
+    global _df_players_cache
+    tried = []
+    for cand in (PLAYERS_XLS, "Players.xls" if PLAYERS_XLS.lower().endswith(".xlsx") else "Players.xlsx"):
+        tried.append(cand)
+        data = get_object(cand)
+        if not data:
+            continue
+        try:
+            df = _read_excel_bytes(data, cand)
+            cols = {str(c).strip(): c for c in df.columns}
+            if "PlayerNo" not in cols or "PlayerName" not in cols:
+                print("?? Players sheet missing required columns. Got:", list(df.columns))
+                continue
+            df = df.rename(columns={cols["PlayerNo"]: "PlayerNo", cols["PlayerName"]: "PlayerName"})
+            df["PlayerNo"] = pd.to_numeric(df["PlayerNo"], errors="coerce")
+            df = df.dropna(subset=["PlayerNo"])
+            df["PlayerNo"] = df["PlayerNo"].astype(int)
+            df["PlayerName"] = df["PlayerName"].astype(str).str.strip()
+            _df_players_cache = df
+            print(f"? Players loaded from {cand}: {len(df)} rows. Examples:",
+                  df.head(min(3, len(df))).to_dict(orient="records"))
+            return df
+        except Exception as e:
+            print(f"Players read error for {cand}:", e)
+    print("?? Players file not found or unreadable. Tried:", tried)
+    _df_players_cache = None
+    return None
 
 def get_player_name(num: int) -> str:
-    global _df_cache
-    if _df_cache is None:
-        _df_cache = read_players_df()
-    if _df_cache is not None and {"PlayerNo","PlayerName"}.issubset(_df_cache.columns):
-        row = _df_cache.loc[_df_cache["PlayerNo"] == num]
-        if not row.empty:
-            return str(row.iloc[0]["PlayerName"]).strip()
+    """Return PlayerName for a given player number (int)."""
+    global _df_players_cache
+    if _df_players_cache is None:
+        _df_players_cache = read_players_df()
+        if _df_players_cache is None:
+            return f"Unknown_{num}"
+    try:
+        n = int(num)
+    except:
+        return f"Unknown_{num}"
+    row = _df_players_cache.loc[_df_players_cache["PlayerNo"] == n]
+    if not row.empty:
+        return str(row.iloc[0]["PlayerName"]).strip()
+    print(f"?? No match in Players for PlayerNo={n}")
     return f"Unknown_{num}"
 
-# Teamnames
+# ---- Teamnames (robust loader + cache)
 _team_df_cache = None
+
 def read_teamnames_df():
+    """Try Teamnames.xlsx, then Teamnames.xls; return DataFrame or None."""
     global _team_df_cache
-    data = get_object(TEAM_XLS)
-    if not data:
-        _team_df_cache = None
-        return None
-    try:
-        _team_df_cache = pd.read_excel(io.BytesIO(data))
-        return _team_df_cache
-    except Exception as e:
-        print("Teamnames.xls read error:", e)
-        _team_df_cache = None
-        return None
+    tried = []
+    for cand in (TEAM_XLS, "Teamnames.xls" if TEAM_XLS.lower().endswith(".xlsx") else "Teamnames.xlsx"):
+        tried.append(cand)
+        data = get_object(cand)
+        if not data:
+            continue
+        try:
+            df = _read_excel_bytes(data, cand)
+            _team_df_cache = df
+            return df
+        except Exception as e:
+            print(f"Teamnames read error for {cand}:", e)
+    print("?? Teamnames file not found or unreadable. Tried:", tried)
+    _team_df_cache = None
+    return None
 
 def load_team_names(default_if_missing=True):
     df = read_teamnames_df()
@@ -216,11 +352,14 @@ def load_state():
     return {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
 
 def reconcile_team_state(new_team_names):
-    """Add any new teams to team_state. Do not delete old ones (avoid mid-auction data loss)."""
     global team_state
     for name in new_team_names:
         team_state.setdefault(name, {"left": BUDGET, "players": []})
-    save_state()
+    try:
+        save_state()
+    except Exception as e:
+        # Avoid failing the whole deploy if bucket/creds aren�t ready yet
+        print("Startup save_state skipped:", e)
 
 # Load teams, then state, then reconcile
 TEAM_NAMES = load_team_names(default_if_missing=True)
@@ -253,7 +392,7 @@ TEMPLATE = r"""<!doctype html><html><head>
 </style></head><body>
 <div class="wrap">
   <div class="topbar">
-    <div><h1>🎯 OCB Auction Board</h1></div>
+    <div><h1>?? OCB Auction Board</h1></div>
     <div>
       <a href="{{ url_for('export_csv') }}" class="subtle" style="margin-right:12px;">Export CSV</a>
       <a href="{{ url_for('admin') }}" class="subtle" style="margin-right:12px;">Admin Upload</a>
@@ -283,7 +422,7 @@ TEMPLATE = r"""<!doctype html><html><head>
             if (!r.ok) { box.style.display='none'; return; }
             const data = await r.json();
             if (!data.items || !data.items.length) { box.style.display='none'; return; }
-            box.innerHTML = data.items.map(it => `<div style="padding:8px;cursor:pointer" data-p="${it.player}">#${it.player} — ${it.file}</div>`).join('');
+            box.innerHTML = data.items.map(it => `<div style="padding:8px;cursor:pointer" data-p="${it.player}">#${it.player} � ${it.file}</div>`).join('');
             Array.from(box.children).forEach(el => { el.onclick = () => { inp.value = el.dataset.p; box.style.display='none'; }; });
             box.style.display = 'block';
           } catch(e) { box.style.display='none'; }
@@ -293,7 +432,7 @@ TEMPLATE = r"""<!doctype html><html><head>
     </script>
     <hr>
     {% if player %}
-      <h3>Showing Player {{ player }} — {{ player_name }}</h3>
+      <h3>Showing Player {{ player }} � {{ player_name }}</h3>
       {% if image_url %}
         <img src="{{ image_url }}" alt="Player {{player}}" style="max-width:300px;border-radius:12px;">
       {% else %}
@@ -319,7 +458,7 @@ TEMPLATE = r"""<!doctype html><html><head>
   <div class="grid">
     {% for t in team_names %}
       <div class="team">
-        <h3>{{t}} <span class="pill">₹{{team_state[t]['left']}}</span></h3>
+        <h3>{{t}} <span class="pill">?{{team_state[t]['left']}}</span></h3>
         <table><thead><tr><th>#</th><th>Player</th><th>Prize</th></tr></thead>
           <tbody>
             {% for p in team_state[t]['players'] %}
@@ -337,7 +476,7 @@ TEMPLATE = r"""<!doctype html><html><head>
 
 VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>OCB Auction Board — View Only</title>
+<title>OCB Auction Board � View Only</title>
 <meta http-equiv="refresh" content="5">
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
@@ -351,10 +490,10 @@ VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
   .subtle{color:#6b7280;font-size:12px;}
 </style></head><body>
 <div class="wrap">
-  <h1>🎯 OCB Auction Board</h1>
+  <h1>?? OCB Auction Board</h1>
   <div class="panel">
     {% if player %}
-      <h3>Showing Player {{ player }} — {{ player_name }}</h3>
+      <h3>Showing Player {{ player }} � {{ player_name }}</h3>
       {% if image_url %}
         <img src="{{ image_url }}" alt="Player {{player}}" style="max-width:300px;border-radius:12px;">
       {% else %}
@@ -367,7 +506,7 @@ VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
   <div class="grid">
     {% for t in team_names %}
       <div class="team">
-        <h3>{{t}} <span class="pill">₹{{team_state[t]['left']}}</span></h3>
+        <h3>{{t}} <span class="pill">?{{team_state[t]['left']}}</span></h3>
         <table><thead><tr><th>#</th><th>Player</th><th>Prize</th></tr></thead>
           <tbody>
             {% for p in team_state[t]['players'] %}
@@ -396,7 +535,7 @@ ADMIN_HTML = """
 <div class="wrap">
   <div class="panel">
     <h2>Admin Uploads</h2>
-    <p class="subtle">Upload a ZIP (images + Players.xls + Teamnames.xls) <b>or</b> select multiple files.</p>
+    <p class="subtle">Upload a ZIP (images + Players.xls/xlsx + Teamnames.xls/xlsx) <b>or</b> select multiple files.</p>
     <h3>Upload ZIP</h3>
     <form method="post" action="{{ url_for('upload_zip') }}" enctype="multipart/form-data">
       <input type="file" name="zipfile" accept=".zip" required>
@@ -408,7 +547,7 @@ ADMIN_HTML = """
       <input type="file" name="files" multiple required>
       <button class="btn" type="submit">Upload Files</button>
     </form>
-    <p style="margin-top:12px"><a href="{{ url_for('main') }}">⬅ Back to Board</a></p>
+    <p style="margin-top:12px"><a href="{{ url_for('main') }}">? Back to Board</a></p>
   </div>
 </div>
 </body></html>
@@ -433,19 +572,21 @@ def upload_zip():
                 if name.endswith("/"): continue
                 base = os.path.basename(name)
                 base = base.replace("\\", "/").split("/")[-1].strip()
-                base = base.lower()
+                base_lower = base.lower()
                 data = z.read(name)
-                if base == PLAYERS_XLS.lower():
-                    put_object(PLAYERS_XLS, data, "application/vnd.ms-excel")
-                elif base == TEAM_XLS.lower():
-                    put_object(TEAM_XLS, data, "application/vnd.ms-excel")
+                if base_lower in ("players.xlsx", "players.xls"):
+                    put_object("Players.xlsx" if base_lower.endswith("xlsx") else "Players.xls",
+                               data, "application/vnd.ms-excel")
+                elif base_lower in ("teamnames.xlsx", "teamnames.xls"):
+                    put_object("Teamnames.xlsx" if base_lower.endswith("xlsx") else "Teamnames.xls",
+                               data, "application/vnd.ms-excel")
                 else:
                     path = f"{IMAGES_DIR}/{base}"
                     ctype = mimetypes.guess_type(base)[0] or "application/octet-stream"
                     put_object(path, data, ctype)
         # refresh caches + reconcile teams
-        global _df_cache, _team_df_cache, TEAM_NAMES, team_state
-        _df_cache = None
+        global _df_players_cache, _team_df_cache, TEAM_NAMES, team_state
+        _df_players_cache = None
         _team_df_cache = None
         TEAM_NAMES = load_team_names(default_if_missing=True)
         reconcile_team_state(TEAM_NAMES)
@@ -462,18 +603,20 @@ def upload_multi():
     for f in files:
         base = os.path.basename(f.filename)
         base = base.replace("\\", "/").split("/")[-1].strip()
-        base = base.lower()
+        base_lower = base.lower()
         data = f.read()
-        if base == PLAYERS_XLS.lower():
-            put_object(PLAYERS_XLS, data, "application/vnd.ms-excel")
-        elif base == TEAM_XLS.lower():
-            put_object(TEAM_XLS, data, "application/vnd.ms-excel")
+        if base_lower in ("players.xlsx", "players.xls"):
+            put_object("Players.xlsx" if base_lower.endswith("xlsx") else "Players.xls",
+                       data, "application/vnd.ms-excel")
+        elif base_lower in ("teamnames.xlsx", "teamnames.xls"):
+            put_object("Teamnames.xlsx" if base_lower.endswith("xlsx") else "Teamnames.xls",
+                       data, "application/vnd.ms-excel")
         else:
             path = f"{IMAGES_DIR}/{base}"
             ctype = mimetypes.guess_type(base)[0] or "application/octet-stream"
             put_object(path, data, ctype)
-    global _df_cache, _team_df_cache, TEAM_NAMES
-    _df_cache = None
+    global _df_players_cache, _team_df_cache, TEAM_NAMES
+    _df_players_cache = None
     _team_df_cache = None
     TEAM_NAMES = load_team_names(default_if_missing=True)
     reconcile_team_state(TEAM_NAMES)
@@ -498,6 +641,19 @@ def api_suggest():
     for it in items:
         uniq.setdefault(it["player"], it)
     return {"items": list(uniq.values())[:10]}
+
+@app.route("/api/diag")
+def api_diag():
+    """Quick check of loaded players data."""
+    df = _df_players_cache or read_players_df()
+    info = {
+        "players_file_candidates": [PLAYERS_XLS, "Players.xls" if PLAYERS_XLS.lower().endswith(".xlsx") else "Players.xlsx"],
+        "loaded": df is not None,
+        "row_count": (0 if df is None else int(len(df))),
+        "columns": (None if df is None else list(df.columns)),
+        "first_rows": (None if df is None else df.head(5).to_dict(orient="records")),
+    }
+    return info
 
 @app.route("/main")
 def main():
