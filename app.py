@@ -90,25 +90,30 @@ def get_object(path: str) -> bytes|None:
         return supabase.storage.from_(BUCKET).download(path)
     except Exception:
         pass
-    # Public URL fallback (no auth) e.g., https://<proj>.supabase.co
+
+    # Public URL fallback (no auth)
     base = os.environ.get("SUPABASE_PUBLIC_URL", "").rstrip("/")
     if base:
         try:
-            import requests, io
+            import requests
             url = f"{base}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
             r = requests.get(url, timeout=15)
             if r.ok:
                 return r.content
-        except Exception:
+        except Exception as e:
+            print("Public URL fallback failed:", e)
             return None
     return None
 
+
 def sign_url(path: str, expires_sec: int = 3600) -> str|None:
-(path: str, expires_sec: int = 3600) -> str|None:
     try:
-        res = supabase.storage.from_(BUCKET).create_signed_url(path, expires_sec)
-        return res.get("signedURL") or res.get("signed_url") or None
-    except Exception:
+        res = supabase.storage.from_(BUCKET).create_signed_url(path, expires_in=expires_sec)
+        if isinstance(res, dict):
+            return res.get("signedURL") or res.get("signed_url")
+        return None
+    except Exception as e:
+        print("sign_url error:", e)
         return None
 
 def list_images(prefix: str = "", limit: int = 50):
