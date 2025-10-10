@@ -145,7 +145,7 @@ def _read_excel_bytes(data: bytes, filename: str):
 _df_players_cache = None
 
 def read_players_df():
-    """Try Players.xlsx, then Players.xls; normalize columns & types."""
+    """Try Players.xlsx, then Players.xls; normalize columns & types (more tolerant headers)."""
     global _df_players_cache
     tried = []
     for cand in (PLAYERS_XLS, "Players.xls" if PLAYERS_XLS.lower().endswith(".xlsx") else "Players.xlsx"):
@@ -155,22 +155,26 @@ def read_players_df():
             continue
         try:
             df = _read_excel_bytes(data, cand)
-            cols = {str(c).strip(): c for c in df.columns}
-            if "PlayerNo" not in cols or "PlayerName" not in cols:
-                print("?? Players sheet missing required columns. Got:", list(df.columns))
+            # Normalize header names (case-insensitive)
+            cols_lower = {c.lower().strip(): c for c in df.columns}
+            pno_key = next((cols_lower[k] for k in cols_lower if "no" in k and "player" in k), None)
+            pname_key = next((cols_lower[k] for k in cols_lower if "name" in k), None)
+
+            if not pno_key or not pname_key:
+                print("⚠️  Players sheet missing expected columns. Found:", list(df.columns))
                 continue
-            df = df.rename(columns={cols["PlayerNo"]: "PlayerNo", cols["PlayerName"]: "PlayerName"})
+
+            df = df.rename(columns={pno_key: "PlayerNo", pname_key: "PlayerName"})
             df["PlayerNo"] = pd.to_numeric(df["PlayerNo"], errors="coerce")
             df = df.dropna(subset=["PlayerNo"])
             df["PlayerNo"] = df["PlayerNo"].astype(int)
             df["PlayerName"] = df["PlayerName"].astype(str).str.strip()
             _df_players_cache = df
-            print(f"? Players loaded from {cand}: {len(df)} rows. Examples:",
-                  df.head(min(3, len(df))).to_dict(orient="records"))
+            print(f"✅ Players loaded from {cand}: {len(df)} rows")
             return df
         except Exception as e:
-            print(f"Players read error for {cand}:", e)
-    print("?? Players file not found or unreadable. Tried:", tried)
+            print(f"❌ Players read error for {cand}: {e}")
+    print("❌ Players file not found or unreadable. Tried:", tried)
     _df_players_cache = None
     return None
 
