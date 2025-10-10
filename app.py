@@ -1,6 +1,5 @@
 import os, io, json, zipfile, mimetypes, csv
 import pandas as pd
-from flask import jsonify
 from datetime import datetime
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
@@ -32,105 +31,6 @@ MAX_UPLOAD_MB= int(os.environ.get("MAX_UPLOAD_MB", "50"))        # per request c
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# --- globals (place near your other globals) ---
-PLAYERS_DF = None
-PLAYERS_LAST_ERROR = None
-PLAYERS_SOURCE = None
-
-def _try_read_excel(path):
-    """Helper: read xlsx/xls if file exists; return (df or None, error or None)."""
-    if not os.path.exists(path):
-        return None, f"not found: {path}"
-    try:
-        if path.lower().endswith(".xlsx"):
-            df = pd.read_excel(path, engine="openpyxl")
-        else:
-            # xlrd only supports .xls (and must be <=1.2.0). Prefer .xlsx overall.
-            df = pd.read_excel(path, engine="xlrd")
-        return df, None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-
-def load_players_sheet():
-    """
-    Try common locations/names. Require columns: PlayerNo, PlayerName.
-    Sets globals: PLAYERS_DF, PLAYERS_LAST_ERROR, PLAYERS_SOURCE.
-    """
-    global PLAYERS_DF, PLAYERS_LAST_ERROR, PLAYERS_SOURCE
-    PLAYERS_DF = None
-    PLAYERS_LAST_ERROR = None
-    PLAYERS_SOURCE = None
-
-    base = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base, "Players.xlsx"),
-        os.path.join(base, "Players.xls"),
-        os.path.join(base, "static", "images", "Players.xlsx"),
-        os.path.join(base, "static", "images", "Players.xls"),
-    ]
-
-    tried = []
-    for p in candidates:
-        df, err = _try_read_excel(p)
-        tried.append({"path": p, "ok": err is None, "err": err})
-        if err is None:
-            # Normalize headers
-            cols = {c.strip(): c for c in df.columns}
-            if "PlayerNo" in cols and "PlayerName" in cols:
-                # Keep only the needed columns; coerce types sensibly
-                df = df.rename(columns={cols["PlayerNo"]: "PlayerNo",
-                                        cols["PlayerName"]: "PlayerName"})
-                # Make PlayerNo int-like if possible
-                try:
-                    df["PlayerNo"] = pd.to_numeric(df["PlayerNo"], errors="coerce").astype("Int64")
-                except Exception:
-                    pass
-                PLAYERS_DF = df
-                PLAYERS_SOURCE = p
-                PLAYERS_LAST_ERROR = None
-                break
-            else:
-                PLAYERS_LAST_ERROR = "Missing required columns: PlayerNo, PlayerName"
-                PLAYERS_DF = None
-
-    if PLAYERS_DF is None and PLAYERS_LAST_ERROR is None:
-        # nothing loaded; report everything we tried
-        PLAYERS_LAST_ERROR = f"Could not load any candidate file. Tried: {json.dumps(tried)}"
-
-# Call once on startup (optional)
-try:
-    load_players_sheet()
-except Exception as _e:
-    PLAYERS_LAST_ERROR = f"Startup load error: {_e}"
-
-@app.route("/api/diag", methods=["GET"])
-def api_diag():
-    """Report whether the players sheet is loaded and show a preview."""
-    global PLAYERS_DF, PLAYERS_LAST_ERROR, PLAYERS_SOURCE
-    loaded = PLAYERS_DF is not None and len(PLAYERS_DF) > 0
-    head = []
-    if loaded:
-        sample = PLAYERS_DF.head(5)[["PlayerNo", "PlayerName"]].astype(str).to_dict(orient="records")
-        head = sample
-    return jsonify({
-        "loaded": loaded,
-        "row_count": 0 if PLAYERS_DF is None else int(len(PLAYERS_DF)),
-        "columns": [] if PLAYERS_DF is None else list(PLAYERS_DF.columns.astype(str)),
-        "source_path": PLAYERS_SOURCE,
-        "last_error": PLAYERS_LAST_ERROR,
-        "first_rows": head
-    })
-
-@app.route("/api/reload", methods=["POST", "GET"])
-def api_reload():
-    """Force reload the Excel (useful after you upload/replace the file)."""
-    try:
-        load_players_sheet()
-        ok = PLAYERS_DF is not None and len(PLAYERS_DF) > 0
-        return jsonify({"reloaded": True, "loaded": ok, "row_count": 0 if not ok else int(len(PLAYERS_DF)), "error": PLAYERS_LAST_ERROR})
-    except Exception as e:
-        return jsonify({"reloaded": False, "error": f"{type(e).__name__}: {e}"}), 500
 
 # ---------- AUTH ----------
 def _authed(): return request.cookies.get("auth") == "ok"
@@ -180,13 +80,31 @@ def put_object(path: str, data: bytes, content_type: str | None = None):
     except Exception:
         supabase.storage.from_(BUCKET).update(path=path, file=data, file_options=file_options)
 
+
 def get_object(path: str) -> bytes|None:
+    """
+    Download object from Supabase Storage. Tries SDK first; if that fails,
+    falls back to the public URL if SUPABASE_PUBLIC_URL is set.
+    """
     try:
         return supabase.storage.from_(BUCKET).download(path)
     except Exception:
-        return None
+        pass
+    # Public URL fallback (no auth) e.g., https://<proj>.supabase.co
+    base = os.environ.get("SUPABASE_PUBLIC_URL", "").rstrip("/")
+    if base:
+        try:
+            import requests, io
+            url = f"{base}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
+            r = requests.get(url, timeout=15)
+            if r.ok:
+                return r.content
+        except Exception:
+            return None
+    return None
 
 def sign_url(path: str, expires_sec: int = 3600) -> str|None:
+(path: str, expires_sec: int = 3600) -> str|None:
     try:
         res = supabase.storage.from_(BUCKET).create_signed_url(path, expires_sec)
         return res.get("signedURL") or res.get("signed_url") or None
@@ -358,7 +276,7 @@ def reconcile_team_state(new_team_names):
     try:
         save_state()
     except Exception as e:
-        # Avoid failing the whole deploy if bucket/creds aren’t ready yet
+        # Avoid failing the whole deploy if bucket/creds arent ready yet
         print("Startup save_state skipped:", e)
 
 # Load teams, then state, then reconcile
@@ -422,7 +340,7 @@ TEMPLATE = r"""<!doctype html><html><head>
             if (!r.ok) { box.style.display='none'; return; }
             const data = await r.json();
             if (!data.items || !data.items.length) { box.style.display='none'; return; }
-            box.innerHTML = data.items.map(it => `<div style="padding:8px;cursor:pointer" data-p="${it.player}">#${it.player} — ${it.file}</div>`).join('');
+            box.innerHTML = data.items.map(it => `<div style="padding:8px;cursor:pointer" data-p="${it.player}">#${it.player}  ${it.file}</div>`).join('');
             Array.from(box.children).forEach(el => { el.onclick = () => { inp.value = el.dataset.p; box.style.display='none'; }; });
             box.style.display = 'block';
           } catch(e) { box.style.display='none'; }
@@ -432,7 +350,7 @@ TEMPLATE = r"""<!doctype html><html><head>
     </script>
     <hr>
     {% if player %}
-      <h3>Showing Player {{ player }} — {{ player_name }}</h3>
+      <h3>Showing Player {{ player }}  {{ player_name }}</h3>
       {% if image_url %}
         <img src="{{ image_url }}" alt="Player {{player}}" style="max-width:300px;border-radius:12px;">
       {% else %}
@@ -476,7 +394,7 @@ TEMPLATE = r"""<!doctype html><html><head>
 
 VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>OCB Auction Board — View Only</title>
+<title>OCB Auction Board  View Only</title>
 <meta http-equiv="refresh" content="5">
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
@@ -493,7 +411,7 @@ VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
   <h1>?? OCB Auction Board</h1>
   <div class="panel">
     {% if player %}
-      <h3>Showing Player {{ player }} — {{ player_name }}</h3>
+      <h3>Showing Player {{ player }}  {{ player_name }}</h3>
       {% if image_url %}
         <img src="{{ image_url }}" alt="Player {{player}}" style="max-width:300px;border-radius:12px;">
       {% else %}
