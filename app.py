@@ -1,10 +1,11 @@
-import os, io, json, zipfile, mimetypes, csv
+import os, io, json, zipfile, mimetypes, csv, time
 import pandas as pd
 from datetime import datetime
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
     make_response, send_file, abort
 )
+from flask import redirect, url_for, flash
 from supabase import create_client, Client  # pip install supabase
 
 # ---------- CONFIG ----------
@@ -72,6 +73,17 @@ def logout():
     return resp
 
 # ---------- STORAGE HELPERS ----------
+def put_object(path: str, data: bytes, content_type: str = "application/json") -> bool:
+    try:
+        # upsert=True overwrites if the file already exists
+        supabase.storage.from_(BUCKET).upload(
+            path, data, {"contentType": content_type, "upsert": True}
+        )
+        return True
+    except Exception as e:
+        print("put_object error:", e)
+        return False
+
 def put_object(path: str, data: bytes, content_type: str | None = None):
     """Upload bytes to Supabase Storage. If the object exists, overwrite with update()."""
     file_options = {"content-type": content_type} if content_type else None
@@ -287,6 +299,26 @@ def reconcile_team_state(new_team_names):
     except Exception as e:
         # Avoid failing the whole deploy if bucket/creds arent ready yet
         print("Startup save_state skipped:", e)
+import json, time
+
+_state_cache = None  # keep with your other caches
+
+def reset_auction_state():
+    """Overwrite auction_state.json with a fresh, empty state."""
+    global _state_cache
+    fresh = {
+        "version": 1,
+        "reset_ts": int(time.time()),
+        "next_player": 1,
+        "sales": [],
+        "assignments": {},
+        "teams": {t: {"players": [], "spent": 0, "balance": BUDGET} for t in TEAM_NAMES},
+    }
+    data = json.dumps(fresh, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ok = put_object("auction_state.json", data, "application/json")
+    if ok:
+        _state_cache = fresh
+    return ok
 
 # Load teams, then state, then reconcile
 TEAM_NAMES = load_team_names(default_if_missing=True)
@@ -450,34 +482,63 @@ VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
 """
 
 ADMIN_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><title>Admin Upload</title>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
-  .wrap{max-width:800px;margin:24px auto;padding:0 16px;}
-  .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
-  .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;}
-  input[type=file]{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
-  .subtle{color:#6b7280;font-size:12px;}
-</style></head><body>
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Admin Upload</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
+    .wrap{max-width:800px;margin:24px auto;padding:0 16px;}
+    .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
+    .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;}
+    input[type=file]{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
+    .subtle{color:#6b7280;font-size:12px;}
+    .danger{background:#dc2626;}
+    hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0;}
+    h2,h3{margin:8px 0 12px;}
+    a{color:#2563eb;text-decoration:none;}
+    a:hover{text-decoration:underline;}
+  </style>
+</head>
+<body>
 <div class="wrap">
   <div class="panel">
     <h2>Admin Uploads</h2>
-    <p class="subtle">Upload a ZIP (images + Players.xls/xlsx + Teamnames.xls/xlsx) <b>or</b> select multiple files.</p>
+    <p class="subtle">
+      Upload a ZIP (images + Players.xls/xlsx + Teamnames.xls/xlsx) <b>or</b> select multiple files.
+    </p>
+
     <h3>Upload ZIP</h3>
     <form method="post" action="{{ url_for('upload_zip') }}" enctype="multipart/form-data">
       <input type="file" name="zipfile" accept=".zip" required>
       <button class="btn" type="submit">Upload ZIP</button>
     </form>
+
     <hr>
+
     <h3>Upload Multiple Files</h3>
     <form method="post" action="{{ url_for('upload_multi') }}" enctype="multipart/form-data">
       <input type="file" name="files" multiple required>
       <button class="btn" type="submit">Upload Files</button>
     </form>
-    <p style="margin-top:12px"><a href="{{ url_for('main') }}">? Back to Board</a></p>
+
+    <hr>
+
+    <h3>Danger zone</h3>
+    <p class="subtle">This will clear all current assignments, reset team balances, and start the auction fresh.</p>
+    <form action="{{ url_for('admin_reset') }}" method="post"
+          onsubmit="return confirm('This will clear ALL assignments and restart the auction. Continue?');">
+      <button class="btn danger" type="submit">?? Reset Auction (start fresh)</button>
+    </form>
+
+    <p style="margin-top:12px">
+      <a href="{{ url_for('main') }}">? Back to Board</a>
+    </p>
   </div>
 </div>
-</body></html>
+</body>
+</html>
 """
 
 # ---------- ROUTES ----------
@@ -485,6 +546,19 @@ ADMIN_HTML = """
 def admin():
     if not _authed(): return redirect(url_for("login"))
     return render_template_string(ADMIN_HTML)
+
+@app.route("/admin/reset", methods=["POST"])
+def admin_reset():
+    if not _authed():              # reuse your existing auth check
+        return ("Unauthorized", 401)
+    ok = reset_auction_state()
+    if ok:
+        try:
+            flash("Auction cleared. Fresh state created.", "success")
+        except Exception:
+            pass
+        return redirect(url_for("admin"))
+    return ("Failed to reset auction (see logs).", 500)
 
 @app.route("/upload_zip", methods=["POST"])
 def upload_zip():
