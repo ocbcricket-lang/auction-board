@@ -160,21 +160,45 @@ def get_private_object(path: str) -> bytes | None:
         return None
 
 def load_upload_password() -> str:
-    # 1) private bucket file
-    data = get_private_object(UPLOAD_PW_FILE)
-    if data:
-        try:
-            pw = data.decode("utf-8").strip()
+    """
+    Load the upload password in this order:
+      1) auction-secure/pwdupload.txt (private bucket)
+      2) env ADMIN_UPLOAD_PASSWORD
+      3) default "upload@123"
+    Handles SDK return shapes and BOM/newlines.
+    """
+    # --- private bucket first ---
+    try:
+        res = supabase.storage.from_(SECURE_BUCKET).download(UPLOAD_PW_FILE)
+        b = None
+        if isinstance(res, (bytes, bytearray)):
+            b = bytes(res)
+        elif hasattr(res, "content"):
+            b = res.content
+        elif isinstance(res, dict):
+            for k in ("content", "data", "file", "body"):
+                v = res.get(k)
+                if isinstance(v, (bytes, bytearray)):
+                    b = bytes(v)
+                    break
+        if b:
+            # use utf-8-sig to auto-strip BOM if present
+            pw = b.decode("utf-8-sig").strip(" \t\r\n")
             if pw:
                 return pw
-        except Exception as e:
-            print("upload pw decode error:", e)
-    # 2) env fallback
-    pw_env = os.environ.get("UPLOAD_PASSWORD")
+    except Exception as e:
+        print("load_upload_password: private bucket load error:", e)
+
+    # --- env fallback ---
+    pw_env = os.environ.get("ADMIN_UPLOAD_PASSWORD")
     if pw_env:
-        return pw_env.strip()
-    # 3) final fallback so you’re never blocked
+        pw_env = pw_env.encode("utf-8", "ignore").decode("utf-8-sig").strip(" \t\r\n")
+        if pw_env:
+            return pw_env
+
+    # --- final fallback ---
     return "upload@123"
+
 
 def list_images(prefix: str = "", limit: int = 50):
     """List image names under images/ that start with <prefix>."""
