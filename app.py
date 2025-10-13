@@ -1,125 +1,147 @@
-# app.py
-# Toy Auction Board (single-file) – names from Players.xlsx, admin + upload password, uploader page, admin reset
-# Requires: supabase>=2.6.0, Flask, pandas, openpyxl
-
-import os, io, json, time, zipfile
-from typing import Optional
-
-from flask import Flask, request, redirect, url_for, render_template_string, make_response, jsonify
-from werkzeug.exceptions import RequestEntityTooLarge
-
+import os, io, json, zipfile, mimetypes, csv, time
 import pandas as pd
-from supabase import create_client, Client
-import requests
+from datetime import datetime
+from flask import (
+    Flask, request, redirect, url_for, render_template_string,
+    make_response, send_file, abort
+)
+from flask import redirect, url_for, flash
+from supabase import create_client, Client  # pip install supabase
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-APP_VERSION = "Auction Board v2.0 (names+uploader+reset+private pw)"
-BUCKET = os.environ.get("BUCKET", "auction")               # public bucket (images, Players.xlsx)
-SECURE_BUCKET = os.environ.get("SECURE_BUCKET", "auction-secure")  # private bucket (pwd files)
+# ---------- CONFIG ----------
+BUDGET = 10_000
+IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
+MAX_IMAGE_NUM = 120
+
+# Storage bucket and object layout
+BUCKET      = "auction"
+PLAYERS_XLS = "Players.xlsx"               # Preferred; will fall back to Players.xls automatically
+TEAM_XLS    = "Teamnames.xlsx"             # Preferred; will fall back to Teamnames.xls
+TEAM_COL    = "TeamName"
+STATE_JSON  = "auction_state.json"
+IMAGES_DIR  = "images"                     # e.g., images/12.jpg
+
+# ---------- ENV (Render ? Environment) ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")  # service role for server-side
-SUPABASE_PUBLIC_URL = os.environ.get("SUPABASE_PUBLIC_URL", SUPABASE_URL).rstrip("/")
-IMAGES_PREFIX = os.environ.get("IMAGES_PREFIX", "images/")       # where images live in public bucket
-PLAYERS_XLS = "Players.xlsx"  # tries .xlsx first; then .xls
-BUDGET = int(os.environ.get("BUDGET", "10000"))
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")   # service role key (server only)
+FLASK_SECRET = os.environ.get("FLASK_SECRET", "change-me")
+VIEW_TOKEN   = os.environ.get("VIEW_TOKEN", "")                  # if set, /view requires ?token=
+MAX_UPLOAD_MB= int(os.environ.get("MAX_UPLOAD_MB", "50"))        # per request cap
 
-TEAM_NAMES = [
-    "Thunder Bolts", "Warriors", "Mighty Eagles", "Tigers", "Falcons",
-    "Sharks", "Panthers", "Rangers", "Titans", "Lions", "Dragons", "Vikings"
-]
-
-# Flask
+# ---------- INIT ----------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload
-
-# -----------------------------
-# SUPABASE CLIENT
-# -----------------------------
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in environment.")
-
+app.secret_key = FLASK_SECRET
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-print(f"### Running {APP_VERSION} ###")
+# ---------- AUTH ----------
+def _authed(): return request.cookies.get("auth") == "ok"
 
+LOGIN_FORM = """
+<!DOCTYPE html><html><head>
+<title>Login</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6}
+  .box{background:#fff;max-width:320px;margin:10vh auto;padding:24px;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,.08);text-align:center}
+  input{display:block;width:100%;margin:10px 0;padding:10px;border-radius:8px;border:1px solid #ccc;font-size:14px}
+  button{background:#2563eb;color:#fff;padding:10px;border:none;border-radius:8px;font-weight:600;cursor:pointer;width:100%}
+</style></head><body>
+  <div class="box">
+    <h2>?? Login</h2>
+    <form method="POST">
+      <input name="username" placeholder="User ID" required>
+      <input name="password" type="password" placeholder="Password" required>
+      <button type="submit">Login</button>
+    </form>
+  </div>
+</body></html>
+"""
 
-# -----------------------------
-# STORAGE HELPERS
-# -----------------------------
-def get_object(path: str) -> Optional[bytes]:
+@app.route("/", methods=["GET","POST"])
+def login():
+    if request.method == "POST":
+        if request.form.get("username")=="admin" and request.form.get("password")=="om@OM1":
+            resp = redirect(url_for("main"))
+            resp.set_cookie("auth", "ok", httponly=True, samesite="Lax")
+            return resp
+        return "<h3 style='color:red;text-align:center;'>Invalid credentials</h3>" + LOGIN_FORM
+    return LOGIN_FORM
+
+@app.route("/logout")
+def logout():
+    resp = redirect(url_for("login"))
+    resp.delete_cookie("auth")
+    return resp
+
+# ---------- STORAGE HELPERS ----------
+def put_object(path: str, data: bytes, content_type: str | None = None) -> bool:
     """
-    Download object from PUBLIC bucket. Try SDK first; fallback to public URL.
-    """
-    try:
-        return supabase.storage.from_(BUCKET).download(path)
-    except Exception as e:
-        # try public URL fallback (no auth)
-        try:
-            if not SUPABASE_PUBLIC_URL:
-                return None
-            url = f"{SUPABASE_PUBLIC_URL}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
-            r = requests.get(url, timeout=15)
-            if r.ok:
-                return r.content
-            return None
-        except Exception as e2:
-            print("get_object public fallback error:", e, "|", e2)
-            return None
-
-
-def get_private_object(path: str) -> Optional[bytes]:
-    """
-    Download from PRIVATE bucket; NO public fallback.
-    """
-    try:
-        return supabase.storage.from_(SECURE_BUCKET).download(path)
-    except Exception as e:
-        print("get_private_object error:", e)
-        return None
-
-
-def put_object(path: str, data: bytes, content_type: Optional[str] = None) -> bool:
-    """
-    Upload to PUBLIC bucket; overwrite if exists.
+    Upload bytes to Supabase Storage. If object already exists, fall back to update().
+    Always return True on success, False on error.
     """
     file_options = {"content-type": content_type} if content_type else None
     try:
+        # Try normal upload (set upsert if your SDK supports it)
         supabase.storage.from_(BUCKET).upload(path=path, file=data, file_options=file_options)
         return True
     except Exception as e1:
         try:
+            # If it already exists, overwrite via update()
             supabase.storage.from_(BUCKET).update(path=path, file=data, file_options=file_options)
             return True
         except Exception as e2:
             print("put_object error:", e1, "| update fallback error:", e2)
             return False
 
+def get_object(path: str) -> bytes|None:
+    """
+    Download object from Supabase Storage. Tries SDK first; if that fails,
+    falls back to the public URL if SUPABASE_PUBLIC_URL is set.
+    """
+    try:
+        return supabase.storage.from_(BUCKET).download(path)
+    except Exception:
+        pass
 
-# -----------------------------
-# PASSWORDS
-# -----------------------------
-def load_admin_password() -> str:
-    # 1) secure bucket file
-    data = get_private_object("pwdadmin.txt")
-    if data:
+    # Public URL fallback (no auth)
+    base = os.environ.get("SUPABASE_PUBLIC_URL", "").rstrip("/")
+    if base:
         try:
-            pw = data.decode("utf-8").strip()
-            if pw:
-                return pw
+            import requests
+            url = f"{base}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
+            r = requests.get(url, timeout=15)
+            if r.ok:
+                return r.content
         except Exception as e:
-            print("admin pw decode error:", e)
-    # 2) env fallback
-    env_pw = os.environ.get("ADMIN_PASSWORD")
-    if env_pw:
-        return env_pw.strip()
-    # 3) final fallback
-    return "om@OM1"
+            print("Public URL fallback failed:", e)
+            return None
+    return None
 
+
+def sign_url(path: str, expires_sec: int = 3600) -> str|None:
+    try:
+        res = supabase.storage.from_(BUCKET).create_signed_url(path, expires_in=expires_sec)
+        if isinstance(res, dict):
+            return res.get("signedURL") or res.get("signed_url")
+        return None
+    except Exception as e:
+        print("sign_url error:", e)
+        return None
+
+# ===== Upload password from private bucket or env (extra password for uploads) =====
+SECURE_BUCKET = os.environ.get("SECURE_BUCKET", "auction-secure")  # private bucket name
+UPLOAD_PW_FILE = "pwdupload.txt"  # one-line text file with the upload password
+
+def get_private_object(path: str) -> bytes | None:
+    """Download from PRIVATE bucket (no public fallback)."""
+    try:
+        return supabase.storage.from_(SECURE_BUCKET).download(path)
+    except Exception as e:
+        print("get_private_object error:", e)
+        return None
 
 def load_upload_password() -> str:
-    data = get_private_object("pwdupload.txt")
+    # 1) private bucket file
+    data = get_private_object(UPLOAD_PW_FILE)
     if data:
         try:
             pw = data.decode("utf-8").strip()
@@ -127,112 +149,191 @@ def load_upload_password() -> str:
                 return pw
         except Exception as e:
             print("upload pw decode error:", e)
-    env_pw = os.environ.get("UPLOAD_PASSWORD")
-    if env_pw:
-        return env_pw.strip()
+    # 2) env fallback
+    pw_env = os.environ.get("UPLOAD_PASSWORD")
+    if pw_env:
+        return pw_env.strip()
+    # 3) final fallback so you�re never blocked
     return "upload@123"
 
+def list_images(prefix: str = "", limit: int = 50):
+    """List image names under images/ that start with <prefix>."""
+    try:
+        entries = supabase.storage.from_(BUCKET).list(path=IMAGES_DIR, limit=1000)
+        names = [e["name"] for e in entries if isinstance(e, dict) and "name" in e]
+        if prefix:
+            names = [n for n in names if n.lower().startswith(prefix.lower())]
+        names.sort()
+        return names[:limit]
+    except Exception as e:
+        print("list_images error:", e)
+        return []
 
-# -----------------------------
-# PLAYERS XLS LOADING + LOOKUP
-# -----------------------------
+def _enforce_upload_size(request_obj):
+    length = request_obj.content_length or 0
+    if length > MAX_UPLOAD_MB * 1024 * 1024:
+        abort(413, f"Upload too large. Max {MAX_UPLOAD_MB} MB per request.")
+
+# ---------- DATA: Players / Teams / State ----------
+import io as _io
+
+def _read_excel_bytes(data: bytes, filename: str):
+    """Read Excel bytes, supporting .xlsx (openpyxl) and .xls (requires xlrd==1.2.0)."""
+    name = filename.lower()
+    if name.endswith(".xls"):
+        # .xls needs xlrd 1.2.0
+        return pd.read_excel(_io.BytesIO(data), engine="xlrd")
+    # .xlsx (default engine)
+    return pd.read_excel(_io.BytesIO(data))
+
+# ---- Players (robust loader + cache)
 _df_players_cache = None
-_playername_by_no = {}
 
-def _read_excel_bytes(data: bytes, filename: str) -> pd.DataFrame:
-    if filename.lower().endswith(".xlsx"):
-        return pd.read_excel(io.BytesIO(data), engine="openpyxl")
-    else:
-        # .xls support requires xlrd<=1.2.0; recommend .xlsx
-        try:
-            return pd.read_excel(io.BytesIO(data), engine="xlrd")
-        except Exception:
-            # try letting pandas guess
-            return pd.read_excel(io.BytesIO(data))
-
-def read_players_df() -> Optional[pd.DataFrame]:
-    global _df_players_cache, _playername_by_no
-    for cand in (PLAYERS_XLS, "Players.xls"):
+def read_players_df():
+    """Try Players.xlsx, then Players.xls; normalize columns & types (more tolerant headers)."""
+    global _df_players_cache
+    tried = []
+    for cand in (PLAYERS_XLS, "Players.xls" if PLAYERS_XLS.lower().endswith(".xlsx") else "Players.xlsx"):
+        tried.append(cand)
         data = get_object(cand)
         if not data:
             continue
         try:
             df = _read_excel_bytes(data, cand)
-            cols_lower = {str(c).strip().lower(): c for c in df.columns}
-            # tolerate variations
-            pno_key = None
-            for key in cols_lower:
-                norm = key.replace(" ", "")
-                if "player" in norm and ("no" in norm or "number" in norm) or norm in ("playerno", "playernumber", "id", "no"):
-                    pno_key = cols_lower[key]
-                    break
-            pname_key = None
-            for key in cols_lower:
-                norm = key.replace(" ", "")
-                if "name" in norm:
-                    pname_key = cols_lower[key]
-                    break
+            # Normalize header names (case-insensitive)
+            cols_lower = {c.lower().strip(): c for c in df.columns}
+            pno_key = next((cols_lower[k] for k in cols_lower if "no" in k and "player" in k), None)
+            pname_key = next((cols_lower[k] for k in cols_lower if "name" in k), None)
 
             if not pno_key or not pname_key:
-                print("⚠️ Players sheet missing expected columns. Found:", list(df.columns))
+                print("⚠️  Players sheet missing expected columns. Found:", list(df.columns))
                 continue
 
             df = df.rename(columns={pno_key: "PlayerNo", pname_key: "PlayerName"})
-            df["PlayerNo"] = pd.to_numeric(df["PlayerNo"], errors="coerce").round()
+            df["PlayerNo"] = pd.to_numeric(df["PlayerNo"], errors="coerce")
             df = df.dropna(subset=["PlayerNo"])
             df["PlayerNo"] = df["PlayerNo"].astype(int)
             df["PlayerName"] = df["PlayerName"].astype(str).str.strip()
-            df = df.drop_duplicates(subset=["PlayerNo"])
             _df_players_cache = df
-            _playername_by_no = {int(n): nm for n, nm in zip(df["PlayerNo"].astype(int), df["PlayerName"])}
-            print(f"✅ Players loaded: {len(df)} rows from {cand}")
+            print(f"✅ Players loaded from {cand}: {len(df)} rows")
             return df
         except Exception as e:
-            print("Players read error for", cand, ":", e)
+            print(f"❌ Players read error for {cand}: {e}")
+    print("❌ Players file not found or unreadable. Tried:", tried)
     _df_players_cache = None
-    _playername_by_no = {}
-    print("❌ Players file not found/unreadable in bucket root (Players.xlsx / Players.xls).")
     return None
 
 def get_player_name(num: int) -> str:
+    """Return PlayerName for a given player number (int)."""
+    global _df_players_cache
+    if _df_players_cache is None:
+        _df_players_cache = read_players_df()
+        if _df_players_cache is None:
+            return f"Unknown_{num}"
     try:
         n = int(num)
-    except Exception:
+    except:
         return f"Unknown_{num}"
-    if not _playername_by_no:
-        read_players_df()
-    return _playername_by_no.get(n, f"Unknown_{n}")
+    row = _df_players_cache.loc[_df_players_cache["PlayerNo"] == n]
+    if not row.empty:
+        return str(row.iloc[0]["PlayerName"]).strip()
+    print(f"?? No match in Players for PlayerNo={n}")
+    return f"Unknown_{num}"
 
+# ---- Teamnames (robust loader + cache)
+_team_df_cache = None
 
-# -----------------------------
-# AUCTION STATE (simple JSON)
-# -----------------------------
-_state_cache = None
+def read_teamnames_df():
+    """Try Teamnames.xlsx, then Teamnames.xls; return DataFrame or None."""
+    global _team_df_cache
+    tried = []
+    for cand in (TEAM_XLS, "Teamnames.xls" if TEAM_XLS.lower().endswith(".xlsx") else "Teamnames.xlsx"):
+        tried.append(cand)
+        data = get_object(cand)
+        if not data:
+            continue
+        try:
+            df = _read_excel_bytes(data, cand)
+            _team_df_cache = df
+            return df
+        except Exception as e:
+            print(f"Teamnames read error for {cand}:", e)
+    print("?? Teamnames file not found or unreadable. Tried:", tried)
+    _team_df_cache = None
+    return None
 
-def _read_state() -> dict:
-    global _state_cache
-    if _state_cache is not None:
-        return _state_cache
-    data = get_object("auction_state.json")
-    if not data:
-        # initialize if missing
-        return reset_auction_state() or {}
+def load_team_names(default_if_missing=True):
+    df = read_teamnames_df()
+    if df is not None and TEAM_COL in df.columns:
+        names = [str(x).strip() for x in df[TEAM_COL].dropna().tolist() if str(x).strip()]
+        seen=set(); ordered=[]
+        for n in names:
+            if n not in seen:
+                seen.add(n); ordered.append(n)
+        if ordered:
+            return ordered
+    if default_if_missing:
+        return [
+            "OCB", "SUPER TITANZ", "HEROES VALLIKUNNAM", "MJ ELEVEN", "EMINS 11",
+            "3K ELEVEN", "ADAMZ", "VIKINGS", "PATH XI", "BROTHERS ADINADU", "GJ BOYS", "SALALA VTML"
+        ]
+    return []
+
+def find_image_key(num: int) -> str|None:
+    # Probe common extensions by attempting to sign; failure => None
+    for ext in IMAGE_EXTS:
+        key = f"{IMAGES_DIR}/{num}{ext}"
+        url = sign_url(key, 5)
+        if url:
+            return key
+    return None
+
+def save_state():
+    payload = {
+        "budget": BUDGET,
+        "team_state": team_state,
+        "current_card": current_card,
+        "saved_at": datetime.now().isoformat(timespec="seconds")
+    }
+    put_object(STATE_JSON, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
+
+def load_state():
+    data = get_object(STATE_JSON)
+    if data:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+            ts = payload.get("team_state", {})
+            # ensure structure
+            for name in TEAM_NAMES:
+                ts.setdefault(name, {"left": BUDGET, "players": []})
+            cc = payload.get("current_card", {})
+            current_card.update({
+                "player": cc.get("player"),
+                "name": cc.get("name"),
+                "image_key": cc.get("image_key"),
+            })
+            return ts
+        except Exception as e:
+            print("State load error:", e)
+    # fresh
+    return {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+
+def reconcile_team_state(new_team_names):
+    global team_state
+    for name in new_team_names:
+        team_state.setdefault(name, {"left": BUDGET, "players": []})
     try:
-        _state_cache = json.loads(data.decode("utf-8"))
-        return _state_cache
-    except Exception:
-        return reset_auction_state() or {}
+        save_state()
+    except Exception as e:
+        # Avoid failing the whole deploy if bucket/creds arent ready yet
+        print("Startup save_state skipped:", e)
+import json, time
 
-def _write_state(state: dict) -> bool:
+_state_cache = None  # keep with your other caches
+
+def reset_auction_state():
+    """Overwrite auction_state.json with a fresh, empty state."""
     global _state_cache
-    buf = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ok = put_object("auction_state.json", buf, "application/json")
-    if ok:
-        _state_cache = state
-    return ok
-
-def reset_auction_state() -> dict:
-    """Overwrite auction_state.json with a fresh state."""
     fresh = {
         "version": 1,
         "reset_ts": int(time.time()),
@@ -241,48 +342,204 @@ def reset_auction_state() -> dict:
         "assignments": {},
         "teams": {t: {"players": [], "spent": 0, "balance": BUDGET} for t in TEAM_NAMES},
     }
-    _write_state(fresh)
-    print("🧹 Auction state reset.")
-    return fresh
+    data = json.dumps(fresh, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ok = put_object("auction_state.json", data, "application/json")
+    if ok:
+        _state_cache = fresh
+    return ok
 
+# Load teams, then state, then reconcile
+TEAM_NAMES = load_team_names(default_if_missing=True)
+current_card = {"player": None, "name": None, "image_key": None}
+team_state   = load_state()
+reconcile_team_state(TEAM_NAMES)
 
-# -----------------------------
-# AUTH & UPLOAD GATE
-# -----------------------------
-def _authed() -> bool:
-    return request.cookies.get("auth") == "ok"
+def _reindex_team(team_name: str):
+    players = team_state[team_name]["players"]
+    for i, p in enumerate(players, start=1):
+        p["idx"] = i
 
-def _can_upload() -> bool:
-    # Allow if admin, else require upload password in form field 'upload_pw'
-    if _authed():
-        return True
-    submitted = (request.form.get("upload_pw") or "").strip()
-    return bool(submitted and submitted == load_upload_password())
-
-
-# -----------------------------
-# HTML TEMPLATES
-# -----------------------------
-ADMIN_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><title>Admin Upload</title>
+# ---------- TEMPLATES ----------
+TEMPLATE = r"""<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>OCB Auction Board</title>
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
-  .wrap{max-width:800px;margin:24px auto;padding:0 16px;}
-  .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
+  .wrap{max-width:1200px;margin:24px auto;padding:0 16px;}
+  h1{font-size:24px;margin-bottom:6px;}
   .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;}
-  input[type=file]{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
+  .input,.select{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
+  .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:16px;}
+  .team{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:12px;}
+  th,td{padding:6px;border-bottom:1px solid #eee;text-align:left;}
+  .pill{background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:999px;font-weight:700;font-size:12px;}
   .subtle{color:#6b7280;font-size:12px;}
-  hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0;}
-  a{color:#2563eb;text-decoration:none;} a:hover{text-decoration:underline;}
-  .danger{background:#dc2626;}
+  .topbar{display:flex;gap:12px;justify-content:space-between;align-items:center;}
 </style></head><body>
+<div class="wrap">
+  <div class="topbar">
+    <div><h1>?? OCB Auction Board</h1></div>
+    <div>
+      <a href="{{ url_for('export_csv') }}" class="subtle" style="margin-right:12px;">Export CSV</a>
+      <a href="{{ url_for('admin') }}" class="subtle" style="margin-right:12px;">Admin Upload</a>
+      <a href="{{ url_for('logout') }}" style="color:#2563eb;font-weight:600;">Logout</a>
+    </div>
+  </div>
+  <div class="panel">
+    <form method="get" action="{{ url_for('main') }}">
+      <label>Next Player:</label>
+      <div style="position:relative">
+        <input class="input" id="playerInput" type="number" name="player" min="1" max="{{ max_image_num }}" placeholder="Enter player # (1-{{max_image_num}})" value="{{ player or '' }}" required>
+        <div id="suggestBox" style="position:absolute;left:0;right:0;top:100%;background:white;border:1px solid #e5e7eb;border-radius:8px;display:none;z-index:10;max-height:220px;overflow:auto"></div>
+      </div>
+      <button class="btn" type="submit" style="margin-top:8px;">Show</button>
+    </form>
+    <script>
+      const inp = document.getElementById('playerInput');
+      const box = document.getElementById('suggestBox');
+      let timer;
+      inp.addEventListener('input', () => {
+        clearTimeout(timer);
+        const val = (inp.value || '').trim();
+        if (!val) { box.style.display = 'none'; return; }
+        timer = setTimeout(async () => {
+          try {
+            const r = await fetch(`{{ url_for('api_suggest') }}?prefix=${encodeURIComponent(val)}`, {credentials:'same-origin'});
+            if (!r.ok) { box.style.display='none'; return; }
+            const data = await r.json();
+            if (!data.items || !data.items.length) { box.style.display='none'; return; }
+            box.innerHTML = data.items.map(it => `<div style="padding:8px;cursor:pointer" data-p="${it.player}">#${it.player}  ${it.file}</div>`).join('');
+            Array.from(box.children).forEach(el => { el.onclick = () => { inp.value = el.dataset.p; box.style.display='none'; }; });
+            box.style.display = 'block';
+          } catch(e) { box.style.display='none'; }
+        }, 200);
+      });
+      document.addEventListener('click', (e) => { if (!box.contains(e.target) && e.target !== inp) box.style.display = 'none'; });
+    </script>
+    <hr>
+    {% if player %}
+      <h3>Showing Player {{ player }}  {{ player_name }}</h3>
+      {% if image_url %}
+        <img src="{{ image_url }}" alt="Player {{player}}" style="max-width:300px;border-radius:12px;">
+      {% else %}
+        <div class="subtle">No image found for Player {{player}}.</div>
+      {% endif %}
+      <form method="post" action="{{ url_for('assign') }}">
+        <label>Assign to Team:</label>
+        <select class="select" name="team" required>
+          <option value="" disabled selected>Select team</option>
+          {% for t in team_names %}<option value="{{t}}">{{t}}</option>{% endfor %}
+        </select>
+        <label>Amount Received:</label>
+        <input class="input" type="number" name="amount" min="0" placeholder="e.g. 500" required>
+        <input type="hidden" name="player" value="{{player}}">
+        <button class="btn" type="submit" style="margin-top:8px;">Submit</button>
+      </form>
+      <form method="post" action="{{ url_for('undo') }}" style="margin-top:8px;">
+        <input type="hidden" name="player" value="{{ player }}">
+        <button class="btn" type="submit">Undo assignment for this player</button>
+      </form>
+    {% endif %}
+  </div>
+  <div class="grid">
+    {% for t in team_names %}
+      <div class="team">
+        <h3>{{t}} <span class="pill">?{{team_state[t]['left']}}</span></h3>
+        <table><thead><tr><th>#</th><th>Player</th><th>Prize</th></tr></thead>
+          <tbody>
+            {% for p in team_state[t]['players'] %}
+              <tr><td>{{p['idx']}}</td><td>{{p['name']}}</td><td>{{p['prize']}}</td></tr>
+            {% endfor %}
+            {% if not team_state[t]['players'] %}
+              <tr><td colspan="3" class="subtle">No players yet.</td></tr>
+            {% endif %}
+          </tbody></table>
+      </div>
+    {% endfor %}
+  </div>
+</div></body></html>
+"""
+
+VIEW_ONLY_TEMPLATE = r"""<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>OCB Auction Board  View Only</title>
+<meta http-equiv="refresh" content="5">
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
+  .wrap{max-width:1200px;margin:24px auto;padding:0 16px;}
+  h1{font-size:24px;margin-bottom:6px;}
+  .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:16px;}
+  .team{background:white;border:1px solid #e5e7eb;border-radius:16px;padding:12px;}
+  th,td{padding:6px;border-bottom:1px solid #eee;text-align:left;}
+  .pill{background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:999px;font-weight:700;font-size:12px;}
+  .subtle{color:#6b7280;font-size:12px;}
+</style></head><body>
+<div class="wrap">
+  <h1>?? OCB Auction Board</h1>
+  <div class="panel">
+    {% if player %}
+      <h3>Showing Player {{ player }}  {{ player_name }}</h3>
+      {% if image_url %}
+        <img src="{{ image_url }}" alt="Player {{player}}" style="max-width:300px;border-radius:12px;">
+      {% else %}
+        <div class="subtle">No image found for Player {{player}}.</div>
+      {% endif %}
+    {% else %}
+      <div class="subtle">Tip: append <code>?player=12</code> to this URL or wait for main page updates.</div>
+    {% endif %}
+  </div>
+  <div class="grid">
+    {% for t in team_names %}
+      <div class="team">
+        <h3>{{t}} <span class="pill">?{{team_state[t]['left']}}</span></h3>
+        <table><thead><tr><th>#</th><th>Player</th><th>Prize</th></tr></thead>
+          <tbody>
+            {% for p in team_state[t]['players'] %}
+              <tr><td>{{p['idx']}}</td><td>{{p['name']}}</td><td>{{p['prize']}}</td></tr>
+            {% endfor %}
+            {% if not team_state[t]['players'] %}
+              <tr><td colspan="3" class="subtle">No players yet.</td></tr>
+            {% endif %}
+          </tbody></table>
+      </div>
+    {% endfor %}
+  </div>
+</div></body></html>
+"""
+
+ADMIN_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Admin Upload</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
+    .wrap{max-width:800px;margin:24px auto;padding:0 16px;}
+    .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
+    .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;}
+    input[type=file]{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
+    .subtle{color:#6b7280;font-size:12px;}
+    .danger{background:#dc2626;}
+    hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0;}
+    h2,h3{margin:8px 0 12px;}
+    a{color:#2563eb;text-decoration:none;}
+    a:hover{text-decoration:underline;}
+  </style>
+</head>
+<body>
 <div class="wrap">
   <div class="panel">
     <h2>Admin Uploads</h2>
-    <p class="subtle">Upload a ZIP (images + Players.xls/xlsx) <b>or</b> select multiple files.</p>
+    <p class="subtle">
+      Upload a ZIP (images + Players.xls/xlsx + Teamnames.xls/xlsx) <b>or</b> select multiple files.
+    </p>
 
     <h3>Upload ZIP</h3>
     <form method="post" action="{{ url_for('upload_zip') }}" enctype="multipart/form-data">
+	 <input type="password" name="upload_pw" placeholder="Upload password" required>
       <input type="file" name="zipfile" accept=".zip" required>
       <button class="btn" type="submit">Upload ZIP</button>
     </form>
@@ -291,240 +548,271 @@ ADMIN_HTML = """
 
     <h3>Upload Multiple Files</h3>
     <form method="post" action="{{ url_for('upload_multi') }}" enctype="multipart/form-data">
+	 <input type="password" name="upload_pw" placeholder="Upload password" required>
       <input type="file" name="files" multiple required>
       <button class="btn" type="submit">Upload Files</button>
     </form>
 
     <hr>
+
     <h3>Danger zone</h3>
-    <p class="subtle">This will clear all current assignments, reset team balances, and start fresh.</p>
+    <p class="subtle">This will clear all current assignments, reset team balances, and start the auction fresh.</p>
     <form action="{{ url_for('admin_reset') }}" method="post"
           onsubmit="return confirm('This will clear ALL assignments and restart the auction. Continue?');">
-      <button class="btn danger" type="submit">🧹 Reset Auction (start fresh)</button>
+      <button class="btn danger" type="submit">?? Reset Auction (start fresh)</button>
     </form>
 
     <p style="margin-top:12px">
-      <a href="{{ url_for('main') }}">↩ Back to Board</a> |
-      <a href="{{ url_for('uploader') }}">Uploader page</a>
+      <a href="{{ url_for('main') }}">? Back to Board</a>
     </p>
   </div>
 </div>
-</body></html>
+</body>
+</html>
 """
 
-UPLOADER_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><title>Upload</title>
-<style>
- body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
- .wrap{max-width:800px;margin:24px auto;padding:0 16px;}
- .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
- .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;}
- input[type=file],input[type=password]{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
- hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0;}
-</style></head><body>
-<div class="wrap"><div class="panel">
-  <h2>Upload Images / Players</h2>
-  <p>Enter the upload password to submit files.</p>
-
-  <h3>Upload ZIP</h3>
-  <form method="post" action="{{ url_for('upload_zip') }}" enctype="multipart/form-data">
-    <input type="password" name="upload_pw" placeholder="Upload password" required>
-    <input type="file" name="zipfile" accept=".zip" required>
-    <button class="btn" type="submit">Upload ZIP</button>
-  </form>
-
-  <hr>
-
-  <h3>Upload Multiple Files</h3>
-  <form method="post" action="{{ url_for('upload_multi') }}" enctype="multipart/form-data">
-    <input type="password" name="upload_pw" placeholder="Upload password" required>
-    <input type="file" name="files" multiple required>
-    <button class="btn" type="submit">Upload Files</button>
-  </form>
-
-  <p style="margin-top:12px"><a href="{{ url_for('main') }}">↩ Back to Board</a></p>
-</div></div></body></html>
-"""
-
-LOGIN_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><title>Login</title>
-<style>
- body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
- .wrap{max-width:420px;margin:80px auto;padding:0 16px;}
- .panel{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
- input[type=password]{padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;}
- .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;margin-top:10px;}
- .subtle{color:#6b7280;font-size:12px;}
-</style></head><body>
-<div class="wrap"><div class="panel">
-  <h2>Admin Login</h2>
-  <form method="post">
-    <input type="password" name="pw" placeholder="Admin password" required>
-    <button class="btn" type="submit">Login</button>
-  </form>
-  <p class="subtle" style="margin-top:12px"><a href="{{ url_for('uploader') }}">Uploader (for end-users)</a></p>
-</div></div></body></html>
-"""
-
-MAIN_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><title>Auction Board</title>
-<style>
- body{font-family:system-ui,-apple-system,Segoe UI,Roboto;background:#f3f4f6;margin:0;color:#111827;}
- .wrap{max-width:720px;margin:24px auto;padding:0 16px;}
- .card{background:white;padding:16px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);}
- input[type=number]{padding:10px;border-radius:8px;border:1px solid #ccc;width:120px;}
- .btn{background:#2563eb;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;margin-left:8px;}
- .subtle{color:#6b7280;font-size:12px;}
- .name{font-size:20px;font-weight:700;margin-top:12px;}
-</style></head><body>
-<div class="wrap">
-  <div class="card">
-    <h2>Auction Board</h2>
-    <form method="get">
-      <label>Player number:</label>
-      <input type="number" name="n" min="1" step="1" value="{{ n or '' }}">
-      <button class="btn" type="submit">Show</button>
-    </form>
-    {% if n %}
-      <div class="name">#{{n}} — {{ name }}</div>
-      <p class="subtle">Tip: place <b>Players.xlsx</b> at bucket root and images under <b>{{ images_prefix }}</b> in public bucket <b>{{ bucket }}</b>.</p>
-    {% endif %}
-    <p style="margin-top:12px"><a href="{{ url_for('admin') }}">Admin</a> | <a href="{{ url_for('uploader') }}">Uploader</a></p>
-  </div>
-</div>
-</body></html>
-"""
-
-# -----------------------------
-# ERROR HANDLER
-# -----------------------------
-@app.errorhandler(RequestEntityTooLarge)
-def too_big(_):
-    return ("File too large. Please upload a smaller file.", 413)
-
-# -----------------------------
-# ROUTES
-# -----------------------------
-@app.route("/")
-def login():
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/", methods=["POST"])
-def do_login():
-    if (request.form.get("pw") or "").strip() == load_admin_password():
-        resp = make_response(redirect(url_for("admin")))
-        resp.set_cookie("auth", "ok", max_age=2*24*3600, httponly=True, samesite="Lax")
-        return resp
-    return ("Unauthorized", 401)
-
-@app.route("/logout")
-def logout():
-    resp = make_response(redirect(url_for("login")))
-    resp.delete_cookie("auth")
-    return resp
-
+# ---------- ROUTES ----------
 @app.route("/admin")
 def admin():
-    if not _authed():
-        return redirect(url_for("login"))
+    if not _authed(): return redirect(url_for("login"))
     return render_template_string(ADMIN_HTML)
-
-@app.route("/uploader")
-def uploader():
-    return render_template_string(UPLOADER_HTML)
 
 @app.route("/admin/reset", methods=["POST"])
 def admin_reset():
-    if not _authed():
+    if not _authed():              # reuse your existing auth check
         return ("Unauthorized", 401)
-    try:
-        reset_auction_state()
+    ok = reset_auction_state()
+    if ok:
+        try:
+            flash("Auction cleared. Fresh state created.", "success")
+        except Exception:
+            pass
         return redirect(url_for("admin"))
-    except Exception as e:
-        print("admin_reset error:", e)
-        return ("Failed to reset auction (see logs)", 500)
+    return ("Failed to reset auction (see logs).", 500)
 
 @app.route("/upload_zip", methods=["POST"])
 def upload_zip():
-    if not _can_upload():
-        return ("Unauthorized", 401)
-    f = request.files.get("zipfile")
-    if not f or not f.filename.lower().endswith(".zip"):
-        return ("Zip file required", 400)
+    if not _authed(): return redirect(url_for("login"))
 
-    zdata = io.BytesIO(f.read())
-    with zipfile.ZipFile(zdata) as z:
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            name = info.filename
-            data = z.read(name)
-            # Decide destination path in public bucket
-            lower = name.lower()
-            dest = None
-            if lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                # images go under images/
-                base = name.split("/")[-1]
-                dest = f"{IMAGES_PREFIX}{base}"
-                put_object(dest, data, content_type="image/jpeg")
-            elif lower.endswith((".xlsx", ".xls")) and "players" in lower:
-                dest = "Players.xlsx" if lower.endswith(".xlsx") else "Players.xls"
-                put_object(dest, data, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                # other files: place at root
-                base = name.split("/")[-1]
-                dest = base
-                put_object(dest, data, content_type="application/octet-stream")
-            if dest:
-                print("uploaded:", dest)
+    # NEW: require the extra upload password
+    submitted = (request.form.get("upload_pw") or "").strip()
+    if submitted != load_upload_password():
+        return ("Unauthorized: bad upload password", 401)
 
-    # refresh players cache
-    read_players_df()
-    return redirect(request.referrer or url_for("uploader"))
+    _enforce_upload_size(request)
+    zf = request.files.get("zipfile")
+    ...
+    if not zf: abort(400, "No zip uploaded")
+    try:
+        buf = io.BytesIO(zf.read())
+        with zipfile.ZipFile(buf) as z:
+            for name in z.namelist():
+                if name.endswith("/"): continue
+                base = os.path.basename(name)
+                base = base.replace("\\", "/").split("/")[-1].strip()
+                base_lower = base.lower()
+                data = z.read(name)
+                if base_lower in ("players.xlsx", "players.xls"):
+                    put_object("Players.xlsx" if base_lower.endswith("xlsx") else "Players.xls",
+                               data, "application/vnd.ms-excel")
+                elif base_lower in ("teamnames.xlsx", "teamnames.xls"):
+                    put_object("Teamnames.xlsx" if base_lower.endswith("xlsx") else "Teamnames.xls",
+                               data, "application/vnd.ms-excel")
+                else:
+                    path = f"{IMAGES_DIR}/{base}"
+                    ctype = mimetypes.guess_type(base)[0] or "application/octet-stream"
+                    put_object(path, data, ctype)
+        # refresh caches + reconcile teams
+        global _df_players_cache, _team_df_cache, TEAM_NAMES, team_state
+        _df_players_cache = None
+        _team_df_cache = None
+        TEAM_NAMES = load_team_names(default_if_missing=True)
+        reconcile_team_state(TEAM_NAMES)
+        return redirect(url_for("admin"))
+    except Exception as e:
+        abort(400, f"Bad ZIP: {e}")
 
 @app.route("/upload_multi", methods=["POST"])
 def upload_multi():
-    if not _can_upload():
-        return ("Unauthorized", 401)
+    if not _authed(): return redirect(url_for("login"))
+
+    # NEW: require the extra upload password
+    submitted = (request.form.get("upload_pw") or "").strip()
+    if submitted != load_upload_password():
+        return ("Unauthorized: bad upload password", 401)
+
+    _enforce_upload_size(request)
     files = request.files.getlist("files")
-    if not files:
-        return ("No files", 400)
-
+    ...
+    if not files: abort(400, "No files uploaded")
     for f in files:
-        fname = f.filename or ""
-        if not fname:
-            continue
+        base = os.path.basename(f.filename)
+        base = base.replace("\\", "/").split("/")[-1].strip()
+        base_lower = base.lower()
         data = f.read()
-        lower = fname.lower()
-        dest = None
-        if lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
-            dest = f"{IMAGES_PREFIX}{fname.split('/')[-1]}"
-            put_object(dest, data, content_type="image/jpeg")
-        elif lower.endswith((".xlsx", ".xls")) and "players" in lower:
-            dest = "Players.xlsx" if lower.endswith(".xlsx") else "Players.xls"
-            put_object(dest, data, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if base_lower in ("players.xlsx", "players.xls"):
+            put_object("Players.xlsx" if base_lower.endswith("xlsx") else "Players.xls",
+                       data, "application/vnd.ms-excel")
+        elif base_lower in ("teamnames.xlsx", "teamnames.xls"):
+            put_object("Teamnames.xlsx" if base_lower.endswith("xlsx") else "Teamnames.xls",
+                       data, "application/vnd.ms-excel")
         else:
-            dest = fname.split("/")[-1]
-            put_object(dest, data, content_type="application/octet-stream")
-        if dest:
-            print("uploaded:", dest)
+            path = f"{IMAGES_DIR}/{base}"
+            ctype = mimetypes.guess_type(base)[0] or "application/octet-stream"
+            put_object(path, data, ctype)
+    global _df_players_cache, _team_df_cache, TEAM_NAMES
+    _df_players_cache = None
+    _team_df_cache = None
+    TEAM_NAMES = load_team_names(default_if_missing=True)
+    reconcile_team_state(TEAM_NAMES)
+    return redirect(url_for("admin"))
 
-    # refresh players cache
-    read_players_df()
-    return redirect(request.referrer or url_for("uploader"))
+@app.route("/api/suggest")
+def api_suggest():
+    if not _authed(): abort(401)
+    prefix = (request.args.get("prefix") or "").strip()
+    if not prefix or not all(c.isdigit() for c in prefix):
+        return {"items": []}
+    names = list_images(prefix=prefix, limit=20)
+    items = []
+    for n in names:
+        try:
+            base = n.rsplit(".", 1)[0]
+            pnum = int(base)
+            items.append({"player": pnum, "file": n})
+        except:
+            pass
+    uniq = {}
+    for it in items:
+        uniq.setdefault(it["player"], it)
+    return {"items": list(uniq.values())[:10]}
+
+@app.route("/api/diag")
+def api_diag():
+    """Quick check of loaded players data."""
+    df = _df_players_cache or read_players_df()
+    info = {
+        "players_file_candidates": [PLAYERS_XLS, "Players.xls" if PLAYERS_XLS.lower().endswith(".xlsx") else "Players.xlsx"],
+        "loaded": df is not None,
+        "row_count": (0 if df is None else int(len(df))),
+        "columns": (None if df is None else list(df.columns)),
+        "first_rows": (None if df is None else df.head(5).to_dict(orient="records")),
+    }
+    return info
 
 @app.route("/main")
 def main():
-    n = request.args.get("n")
-    name = None
-    if n:
-        name = get_player_name(n)
-    return render_template_string(MAIN_HTML, n=n, name=name, images_prefix=IMAGES_PREFIX, bucket=BUCKET)
+    if not _authed(): return redirect(url_for("login"))
+    raw = (request.args.get("player") or "").strip()
+    player=None; image_url=None; player_name=None; key=None
+    if raw:
+        try:
+            n = int(raw)
+            if 1 <= n <= MAX_IMAGE_NUM:
+                player = n
+                key = find_image_key(n)
+                image_url = sign_url(key) if key else None
+                player_name = get_player_name(n)
+        except: pass
+    if player is not None:
+        current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
+        save_state()
+    return render_template_string(
+        TEMPLATE,
+        player=player, player_name=player_name, image_url=image_url,
+        team_names=TEAM_NAMES, team_state=team_state, max_image_num=MAX_IMAGE_NUM, budget=BUDGET
+    )
 
-@app.route("/api/name/<int:num>")
-def api_name(num: int):
-    return jsonify({"num": num, "name": get_player_name(num)})
+@app.route("/assign", methods=["POST"])
+def assign():
+    if not _authed(): return redirect(url_for("login"))
+    team  = request.form.get("team")
+    amount= int(request.form.get("amount", 0))
+    player= request.form.get("player")
+    if team not in team_state or not player: return redirect(url_for("main"))
+    num = int(player)
+    pname = get_player_name(num)
+    display = f"{num}_{pname}"
+    if amount > team_state[team]["left"]:
+        return f"<h3 style='color:red'>Not enough budget in {team}. <a href='{url_for('main')}'>Back</a></h3>"
+    idx = len(team_state[team]["players"]) + 1
+    team_state[team]["players"].append({"idx": idx, "name": display, "prize": amount, "player_num": num})
+    team_state[team]["left"] -= amount
+    save_state()
+    return redirect(url_for("main", player=player))
 
-@app.route("/version")
-def version():
-    return {"version": APP_VERSION}
+@app.route("/undo", methods=["POST"])
+def undo():
+    if not _authed(): return redirect(url_for("login"))
+    raw = (request.form.get("player") or "").strip()
+    try: target = int(raw)
+    except: return redirect(url_for("main"))
+    for team, state in team_state.items():
+        for i, p in enumerate(list(state["players"])):
+            match = (p.get("player_num")==target) or (isinstance(p.get("name"), str) and p["name"].startswith(f"{target}_"))
+            if match:
+                state["left"] += int(p.get("prize", 0))
+                state["players"].pop(i)
+                _reindex_team(team)
+                save_state()
+                return redirect(url_for("main", player=target))
+    return redirect(url_for("main", player=raw))
+
+@app.route("/view")
+def view():
+    # token protection if configured
+    if VIEW_TOKEN:
+        token = request.args.get("token", "")
+        if token != VIEW_TOKEN:
+            abort(401)
+    raw = (request.args.get("player") or "").strip()
+    player=None; image_url=None; player_name=None; key=None
+    if raw:
+        try:
+            n = int(raw)
+            if 1 <= n <= MAX_IMAGE_NUM:
+                player = n
+                key = find_image_key(n)
+                image_url = sign_url(key) if key else None
+                player_name = get_player_name(n)
+        except: pass
+    if player is None and current_card.get("player") is not None:
+        player = current_card["player"]
+        key    = current_card["image_key"]
+        image_url = sign_url(key) if key else None
+        player_name = current_card["name"] or get_player_name(player)
+    html = render_template_string(
+        VIEW_ONLY_TEMPLATE,
+        player=player, player_name=player_name, image_url=image_url,
+        team_names=TEAM_NAMES, team_state=team_state, max_image_num=MAX_IMAGE_NUM, budget=BUDGET
+    )
+    resp = make_response(html); resp.headers["Cache-Control"]="no-store"; return resp
+
+@app.route("/export.csv")
+def export_csv():
+    if not _authed(): abort(401)
+    rows = []
+    for team in TEAM_NAMES:
+        left = team_state[team]["left"]
+        for p in team_state[team]["players"]:
+            num = int(p.get("player_num", -1))
+            pname = get_player_name(num)
+            rows.append({
+                "Team": team,
+                "Idx": p.get("idx"),
+                "PlayerNum": num,
+                "PlayerName": pname,
+                "DisplayName": p.get("name"),
+                "Prize": p.get("prize"),
+                "TeamBudgetLeft": left
+            })
+    si = io.StringIO()
+    writer = csv.DictWriter(si, fieldnames=["Team","Idx","PlayerNum","PlayerName","DisplayName","Prize","TeamBudgetLeft"])
+    writer.writeheader()
+    for r in rows: writer.writerow(r)
+    out = io.BytesIO(si.getvalue().encode("utf-8"))
+    return send_file(out, mimetype="text/csv", as_attachment=True, download_name=f"auction_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+
+# Local dev
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
