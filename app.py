@@ -73,25 +73,24 @@ def logout():
     return resp
 
 # ---------- STORAGE HELPERS ----------
-def put_object(path: str, data: bytes, content_type: str = "application/json") -> bool:
-    try:
-        # upsert=True overwrites if the file already exists
-        supabase.storage.from_(BUCKET).upload(
-            path, data, {"contentType": content_type, "upsert": True}
-        )
-        return True
-    except Exception as e:
-        print("put_object error:", e)
-        return False
-
-def put_object(path: str, data: bytes, content_type: str | None = None):
-    """Upload bytes to Supabase Storage. If the object exists, overwrite with update()."""
+def put_object(path: str, data: bytes, content_type: str | None = None) -> bool:
+    """
+    Upload bytes to Supabase Storage. If object already exists, fall back to update().
+    Always return True on success, False on error.
+    """
     file_options = {"content-type": content_type} if content_type else None
     try:
+        # Try normal upload (set upsert if your SDK supports it)
         supabase.storage.from_(BUCKET).upload(path=path, file=data, file_options=file_options)
-    except Exception:
-        supabase.storage.from_(BUCKET).update(path=path, file=data, file_options=file_options)
-
+        return True
+    except Exception as e1:
+        try:
+            # If it already exists, overwrite via update()
+            supabase.storage.from_(BUCKET).update(path=path, file=data, file_options=file_options)
+            return True
+        except Exception as e2:
+            print("put_object error:", e1, "| update fallback error:", e2)
+            return False
 
 def get_object(path: str) -> bytes|None:
     """
