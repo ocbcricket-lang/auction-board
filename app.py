@@ -22,8 +22,16 @@ STATE_JSON  = "auction_state.json"
 IMAGES_DIR  = "images"                     # e.g., images/12.jpg
 
 # ---------- ENV (Render ? Environment) ----------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")   # service role key (server only)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # REQUIRED: service_role key
+    or os.getenv("SUPABASE_KEY")            # optional alias if you used this name before
+    or ""
+)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 FLASK_SECRET = os.environ.get("FLASK_SECRET", "change-me")
 VIEW_TOKEN   = os.environ.get("VIEW_TOKEN", "")                  # if set, /view requires ?token=
 MAX_UPLOAD_MB= int(os.environ.get("MAX_UPLOAD_MB", "50"))        # per request cap
