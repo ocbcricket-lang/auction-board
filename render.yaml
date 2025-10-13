@@ -3,16 +3,42 @@ services:
     name: auction-board
     env: python
     plan: free
+    autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --preload --workers=2 --threads=8 --timeout=120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers=2 --threads=8 --timeout=120 --preload
+    healthCheckPath: /version
+
     envVars:
+      # ---- Required Supabase config (set these in Render dashboard) ----
       - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLIC_URL      # usually same as SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+
+      # ---- App buckets ----
+      - key: BUCKET                   # public bucket for images + Players.xlsx
+        value: auction
+      - key: SECURE_BUCKET            # private bucket for pwdadmin.txt + pwdupload.txt
+        value: auction-secure
+
+      # ---- Optional fallbacks (you can leave these unset if using the files) ----
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: UPLOAD_PASSWORD
+        sync: false
+
+      # ---- Your existing vars (kept) ----
       - key: FLASK_SECRET
         sync: false
       - key: VIEW_TOKEN
         sync: false
       - key: MAX_UPLOAD_MB
         sync: false
+
+      # ---- Optional tuning ----
+      - key: IMAGES_PREFIX
+        value: images/
+      - key: BUDGET
+        value: "10000"
