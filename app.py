@@ -67,7 +67,7 @@ LOGIN_FORM = """
 @app.route("/", methods=["GET","POST"])
 def login():
     if request.method == "POST":
-        if request.form.get("username")=="admin" and request.form.get("password")=="om@OM1":
+        if request.form.get("username")=="admin" and request.form.get("password")==load_admin_password():
             resp = redirect(url_for("main"))
             resp.set_cookie("auth", "ok", httponly=True, samesite="Lax")
             return resp
@@ -138,6 +138,7 @@ def sign_url(path: str, expires_sec: int = 3600) -> str|None:
 # ===== Upload password from private bucket or env (extra password for uploads) =====
 SECURE_BUCKET = os.environ.get("SECURE_BUCKET", "auction-secure")  # private bucket name
 UPLOAD_PW_FILE = "pwdupload.txt"  # one-line text file with the upload password
+ADMIN_PW_FILE = "pwdadmin.txt"  # one-line text file with the admin password
 
 def get_private_object(path: str) -> bytes | None:
     """Download from PRIVATE bucket (no public fallback). Normalizes return to bytes."""
@@ -199,6 +200,34 @@ def load_upload_password() -> str:
     # --- final fallback ---
     return "upload@123"
 
+def load_admin_password() -> str:
+    """
+    Load admin password from auction-secure/pwdadmin.txt, then env, else default.
+    """
+    try:
+        # Re-use the same normalization logic as upload
+        res = supabase.storage.from_(SECURE_BUCKET).download(ADMIN_PW_FILE)
+        content = None
+        if isinstance(res, (bytes, bytearray)):
+            content = res
+        elif hasattr(res, "content"):
+            content = res.content
+        elif isinstance(res, dict):
+            content = res.get("content") or res.get("data") or res.get("file") or res.get("body")
+        if content:
+            pw = content.decode("utf-8-sig").strip(" \r\n\t")
+            if pw:
+                return pw
+    except Exception as e:
+        print("load_admin_password: private bucket load error:", e)
+
+    # env fallback
+    pw_env = os.environ.get("ADMIN_PASSWORD")
+    if pw_env:
+        return pw_env.encode("utf-8", "ignore").decode("utf-8-sig").strip(" \r\n\t")
+
+    # final fallback
+    return "admin@123"
 
 def list_images(prefix: str = "", limit: int = 50):
     """List image names under images/ that start with <prefix>."""
