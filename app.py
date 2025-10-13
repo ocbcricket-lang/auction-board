@@ -140,9 +140,21 @@ SECURE_BUCKET = os.environ.get("SECURE_BUCKET", "auction-secure")  # private buc
 UPLOAD_PW_FILE = "pwdupload.txt"  # one-line text file with the upload password
 
 def get_private_object(path: str) -> bytes | None:
-    """Download from PRIVATE bucket (no public fallback)."""
+    """Download from PRIVATE bucket (no public fallback). Normalizes return to bytes."""
     try:
-        return supabase.storage.from_(SECURE_BUCKET).download(path)
+        res = supabase.storage.from_(SECURE_BUCKET).download(path)
+        # Normalize common SDK return shapes
+        if isinstance(res, (bytes, bytearray)):
+            return bytes(res)
+        if hasattr(res, "content"):               # e.g., Response-like object
+            return res.content
+        if isinstance(res, dict):                 # e.g., {"data": b"..."} or similar
+            for k in ("data", "file", "content", "body"):
+                b = res.get(k)
+                if isinstance(b, (bytes, bytearray)):
+                    return bytes(b)
+        print("get_private_object: unexpected return type:", type(res))
+        return None
     except Exception as e:
         print("get_private_object error:", e)
         return None
