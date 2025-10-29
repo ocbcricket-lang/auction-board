@@ -409,8 +409,12 @@ import json, time
 _state_cache = None  # keep with your other caches
 
 def reset_auction_state():
-    """Overwrite auction_state.json with a fresh, empty state."""
-    global _state_cache
+    """Completely reset the auction — both Supabase and local memory caches."""
+    global _state_cache, team_state, _df_players_cache, _team_df_cache, current_card
+
+    print("⚠️ Resetting auction state...")
+
+    # Build a fresh empty state structure
     fresh = {
         "version": 1,
         "reset_ts": int(time.time()),
@@ -419,10 +423,29 @@ def reset_auction_state():
         "assignments": {},
         "teams": {t: {"players": [], "spent": 0, "balance": BUDGET} for t in TEAM_NAMES},
     }
-    data = json.dumps(fresh, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ok = put_object("auction_state.json", data, "application/json")
+
+    # Overwrite the Supabase JSON file
+    data = json.dumps({
+        "budget": BUDGET,
+        "team_state": {t: {"left": BUDGET, "players": []} for t in TEAM_NAMES},
+        "current_card": {"player": None, "name": None, "image_key": None},
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    ok = put_object(STATE_JSON, data, "application/json")
+
+    # Clear all memory caches
+    _state_cache = None
+    _df_players_cache = None
+    _team_df_cache = None
+    current_card = {"player": None, "name": None, "image_key": None}
+    team_state = {t: {"left": BUDGET, "players": []} for t in TEAM_NAMES}
+
     if ok:
-        _state_cache = fresh
+        print("✅ Auction state fully reset.")
+    else:
+        print("❌ Failed to overwrite auction_state.json")
+
     return ok
 
 # Load teams, then state, then reconcile
