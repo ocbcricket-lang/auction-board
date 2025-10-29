@@ -377,16 +377,16 @@ def save_state():
         return False
 
 def load_state(force_reload=False):
-    """Load auction state from Supabase once, unless forced."""
+    """Load auction state from Supabase Storage JSON file."""
     global team_state
     if team_state and not force_reload:
         return team_state
 
     data = get_object(STATE_JSON)
     if not data:
-        print("⚠️ No auction_state.json found. Creating fresh.")
+        print("⚠️  No auction_state.json found — starting fresh.")
         team_state = {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
-        save_state()
+        #save_state()
         return team_state
 
     try:
@@ -396,10 +396,10 @@ def load_state(force_reload=False):
             ts.setdefault(name, {"left": BUDGET, "players": []})
         current_card.update(payload.get("current_card", {}))
         team_state = ts
-        print(f"✅ Loaded state: {sum(len(v['players']) for v in ts.values())} players assigned.")
+        print(f"✅  Loaded state with {sum(len(v['players']) for v in ts.values())} assigned players.")
         return ts
     except Exception as e:
-        print("⚠️ load_state error:", e)
+        print("⚠️  load_state error:", e)
         team_state = {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
         return team_state
 
@@ -408,7 +408,7 @@ def reconcile_team_state(new_team_names):
     for name in new_team_names:
         team_state.setdefault(name, {"left": BUDGET, "players": []})
     try:
-        save_state()
+        #save_state()
     except Exception as e:
         # Avoid failing the whole deploy if bucket/creds arent ready yet
         print("Startup save_state skipped:", e)
@@ -439,7 +439,7 @@ current_card = {"player": None, "name": None, "image_key": None}
 TEAM_NAMES = load_team_names(default_if_missing=True)
 team_state = {t: {"left": BUDGET, "players": []} for t in TEAM_NAMES}
 current_card = {"player": None, "name": None, "image_key": None}
-save_state()  # optional: starts with a fresh blank file
+#save_state()  # optional: starts with a fresh blank file
 
 def _reindex_team(team_name: str):
     players = team_state[team_name]["players"]
@@ -789,7 +789,12 @@ def api_diag():
 
 @app.route("/main")
 def main():
-    if not _authed(): return redirect(url_for("login"))
+    if not _authed():
+        return redirect(url_for("login"))
+
+    global team_state
+    team_state = load_state(force_reload=True)   # <— NEW LINE
+
     raw = (request.args.get("player") or "").strip()
     player=None; image_url=None; player_name=None; key=None
     if raw:
@@ -800,10 +805,11 @@ def main():
                 key = find_image_key(n)
                 image_url = sign_url(key) if key else None
                 player_name = get_player_name(n)
-        except: pass
+        except:
+            pass
     if player is not None:
         current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
-        #save_state()
+
     return render_template_string(
         TEMPLATE,
         player=player, player_name=player_name, image_url=image_url,
@@ -899,6 +905,11 @@ def export_csv():
     for r in rows: writer.writerow(r)
     out = io.BytesIO(si.getvalue().encode("utf-8"))
     return send_file(out, mimetype="text/csv", as_attachment=True, download_name=f"auction_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+
+team_state = {}
+current_card = {"player": None, "name": None, "image_key": None}
+TEAM_NAMES = load_team_names(default_if_missing=True)
+team_state = load_state(force_reload=True)
 
 # Local dev
 if __name__ == "__main__":
