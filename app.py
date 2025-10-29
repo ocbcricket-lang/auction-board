@@ -100,30 +100,28 @@ def put_object(path: str, data: bytes, content_type: str | None = None) -> bool:
             print("put_object error:", e1, "| update fallback error:", e2)
             return False
 
-def get_object(path: str) -> bytes|None:
+def get_object(path: str) -> bytes | None:
     """
-    Download object from Supabase Storage. Tries SDK first; if that fails,
-    falls back to the public URL if SUPABASE_PUBLIC_URL is set.
+    Download object from Supabase Storage and normalize the return type.
+    Ensures it always returns bytes on success.
     """
     try:
-        return supabase.storage.from_(BUCKET).download(path)
-    except Exception:
-        pass
-
-    # Public URL fallback (no auth)
-    base = os.environ.get("SUPABASE_PUBLIC_URL", "").rstrip("/")
-    if base:
-        try:
-            import requests
-            url = f"{base}/storage/v1/object/public/{BUCKET}/{path.lstrip('/')}"
-            r = requests.get(url, timeout=15)
-            if r.ok:
-                return r.content
-        except Exception as e:
-            print("Public URL fallback failed:", e)
-            return None
-    return None
-
+        res = supabase.storage.from_(BUCKET).download(path)
+        # Normalize all possible SDK return shapes
+        if isinstance(res, (bytes, bytearray)):
+            return bytes(res)
+        if hasattr(res, "content"):
+            return res.content
+        if isinstance(res, dict):
+            for k in ("data", "file", "content", "body"):
+                b = res.get(k)
+                if isinstance(b, (bytes, bytearray)):
+                    return bytes(b)
+        print("get_object: unexpected type", type(res))
+        return None
+    except Exception as e:
+        print("get_object error:", e)
+        return None
 
 def sign_url(path: str, expires_sec: int = 3600) -> str|None:
     try:
@@ -371,25 +369,31 @@ def save_state():
     put_object(STATE_JSON, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
 
 def load_state():
+    """Load auction state safely from Supabase JSON file."""
     data = get_object(STATE_JSON)
-    if data:
-        try:
-            payload = json.loads(data.decode("utf-8"))
-            ts = payload.get("team_state", {})
-            # ensure structure
-            for name in TEAM_NAMES:
-                ts.setdefault(name, {"left": BUDGET, "players": []})
-            cc = payload.get("current_card", {})
-            current_card.update({
-                "player": cc.get("player"),
-                "name": cc.get("name"),
-                "image_key": cc.get("image_key"),
-            })
-            return ts
-        except Exception as e:
-            print("State load error:", e)
-    # fresh
-    return {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+    if not data:
+        print("⚠️  No auction_state.json found, creating fresh state.")
+        return {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+
+    global team_state
+    try:
+        payload = json.loads(data.decode("utf-8"))
+        ts = payload.get("team_state", {})
+        # ensure structure for all teams
+        for name in TEAM_NAMES:
+            ts.setdefault(name, {"left": BUDGET, "players": []})
+        cc = payload.get("current_card", {})
+        current_card.update({
+            "player": cc.get("player"),
+            "name": cc.get("name"),
+            "image_key": cc.get("image_key"),
+        })
+        print(f"✅ Loaded auction state with {sum(len(t['players']) for t in ts.values())} assigned players.")
+        return ts
+    except Exception as e:
+        # keep previous state instead of wiping
+        print("⚠️  State load error, keeping previous state:", e)
+        return team_state or {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
 
 def reconcile_team_state(new_team_names):
     global team_state
