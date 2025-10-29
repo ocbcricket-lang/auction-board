@@ -434,10 +434,13 @@ def reset_auction_state():
 
 
 # Load teams, then state, then reconcile
-TEAM_NAMES = load_team_names(default_if_missing=True)
+# Initialize globals before first load
+team_state = {}   # declare first to avoid NameError
 current_card = {"player": None, "name": None, "image_key": None}
-team_state   = load_state()
+TEAM_NAMES = load_team_names(default_if_missing=True)
+team_state = load_state()  # now safe to call
 reconcile_team_state(TEAM_NAMES)
+
 
 def _reindex_team(team_name: str):
     players = team_state[team_name]["players"]
