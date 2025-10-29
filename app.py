@@ -790,6 +790,7 @@ def api_diag():
     return info
 
 @app.route("/main")
+@app.route("/main")
 def main():
     if not _authed():
         return redirect(url_for("login"))
