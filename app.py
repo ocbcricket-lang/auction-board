@@ -227,7 +227,7 @@ def load_admin_password() -> str:
         return pw_env.encode("utf-8", "ignore").decode("utf-8-sig").strip(" \r\n\t")
 
     # final fallback
-    return "om@OM1"
+    return "vatta@A10"
 
 def list_images(prefix: str = "", limit: int = 50):
     """List image names under images/ that start with <prefix>."""
