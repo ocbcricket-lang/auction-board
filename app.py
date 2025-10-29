@@ -871,20 +871,26 @@ def assign():
 
 @app.route("/undo", methods=["POST"])
 def undo():
-    if not _authed(): return redirect(url_for("login"))
+    if not _authed():
+        return redirect(url_for("login"))
     raw = (request.form.get("player") or "").strip()
-    try: target = int(raw)
-    except: return redirect(url_for("main"))
+    try:
+        target = int(raw)
+    except:
+        return redirect(url_for("main"))
     for team, state in team_state.items():
         for i, p in enumerate(list(state["players"])):
-            match = (p.get("player_num")==target) or (isinstance(p.get("name"), str) and p["name"].startswith(f"{target}_"))
+            match = (
+                p.get("player_num") == target
+                or (isinstance(p.get("name"), str) and p["name"].startswith(f"{target}_"))
+            )
             if match:
                 state["left"] += int(p.get("prize", 0))
                 state["players"].pop(i)
                 _reindex_team(team)
                 save_state()
-				team_state = load_state(force_reload=True)
-            	return redirect(url_for("main", player=target))
+                team_state = load_state(force_reload=True)
+                return redirect(url_for("main", player=target))
     return redirect(url_for("main", player=raw))
 
 @app.route("/view")
