@@ -370,7 +370,7 @@ def save_state():
         }
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         put_object(STATE_JSON, data, "application/json")
-		time.sleep(0.2)
+        time.sleep(0.2)
         print("💾 State saved.")
         return True
     except Exception as e:
