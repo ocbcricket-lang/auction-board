@@ -838,7 +838,7 @@ def assign():
     team_state[team]["players"].append({"idx": idx, "name": display, "prize": amount, "player_num": num})
     team_state[team]["left"] -= amount
     save_state()
-	team_state = load_state(force_reload=True)   # <— add this line
+    team_state = load_state(force_reload=True)   # <— add this line
 	return redirect(url_for("main", player=player))
 
 @app.route("/undo", methods=["POST"])
