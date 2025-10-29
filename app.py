@@ -368,9 +368,9 @@ def save_state():
             "current_card": current_card,
             "saved_at": datetime.now().isoformat(timespec="seconds")
         }
-    	data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    	put_object(STATE_JSON, data, "application/json")
-    	time.sleep(0.2)
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        put_object(STATE_JSON, data, "application/json")
+        time.sleep(0.2)
         print("💾 State saved.")
         return True
     except Exception as e:
