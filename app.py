@@ -795,10 +795,14 @@ def main():
         return redirect(url_for("login"))
 
     global team_state
-    team_state = load_state(force_reload=True)   # <— NEW LINE
+    team_state = load_state(force_reload=True)  # ensure fresh state
 
     raw = (request.args.get("player") or "").strip()
-    player=None; image_url=None; player_name=None; key=None
+    player = None
+    image_url = None
+    player_name = None
+    key = None
+
     if raw:
         try:
             n = int(raw)
@@ -807,12 +811,17 @@ def main():
                 key = find_image_key(n)
                 image_url = sign_url(key) if key else None
                 player_name = get_player_name(n)
-        except:
+        except Exception:
             pass
+
     if player is not None:
-    	current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
-	
-	    html = render_template_string(
+        current_card.update({
+            "player": player,
+            "name": player_name,
+            "image_key": key if image_url else None
+        })
+
+    html = render_template_string(
         TEMPLATE,
         player=player,
         player_name=player_name,
@@ -825,8 +834,6 @@ def main():
     resp = make_response(html)
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
 
 @app.route("/assign", methods=["POST"])
 def assign():
