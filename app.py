@@ -408,7 +408,7 @@ def reconcile_team_state(new_team_names):
     for name in new_team_names:
         team_state.setdefault(name, {"left": BUDGET, "players": []})
     try:
-        #save_state()
+        pass #save_state()
     except Exception as e:
         # Avoid failing the whole deploy if bucket/creds arent ready yet
         print("Startup save_state skipped:", e)
