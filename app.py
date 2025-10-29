@@ -407,12 +407,13 @@ def load_state(force_reload=False):
 def reconcile_team_state(new_team_names):
     global team_state
     for name in new_team_names:
-    	team_state.setdefault(name, {"left": BUDGET, "players": []})
-	try:
-    	pass #save_state()
+        team_state.setdefault(name, {"left": BUDGET, "players": []})
+    try:
+        pass  # save_state()
     except Exception as e:
-        # Avoid failing the whole deploy if bucket/creds arent ready yet
-    	print("Startup save_state skipped:", e)
+        # Avoid failing the whole deploy if bucket/creds aren't ready yet
+        print("Startup save_state skipped:", e)
+
 import json, time
 
 _state_cache = None  # keep with your other caches
