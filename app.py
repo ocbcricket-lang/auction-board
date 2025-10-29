@@ -230,7 +230,7 @@ def load_admin_password() -> str:
 def list_images(prefix: str = "", limit: int = 50):
     """List image names under images/ that start with <prefix>."""
     try:
-        entries = supabase.storage.from_(BUCKET).list(path=IMAGES_DIR, limit=1000)
+        entries = supabase.storage.from_(BUCKET).list(path=IMAGES_DIR)
         names = [e["name"] for e in entries if isinstance(e, dict) and "name" in e]
         if prefix:
             names = [n for n in names if n.lower().startswith(prefix.lower())]
