@@ -803,7 +803,7 @@ def main():
         except: pass
     if player is not None:
         current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
-        save_state()
+        #save_state()
     return render_template_string(
         TEMPLATE,
         player=player, player_name=player_name, image_url=image_url,
