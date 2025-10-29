@@ -360,40 +360,48 @@ def find_image_key(num: int) -> str|None:
     return None
 
 def save_state():
-    payload = {
-        "budget": BUDGET,
-        "team_state": team_state,
-        "current_card": current_card,
-        "saved_at": datetime.now().isoformat(timespec="seconds")
-    }
-    put_object(STATE_JSON, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
+    """Persist in-memory state to Supabase."""
+    try:
+        payload = {
+            "budget": BUDGET,
+            "team_state": team_state,
+            "current_card": current_card,
+            "saved_at": datetime.now().isoformat(timespec="seconds")
+        }
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        put_object(STATE_JSON, data, "application/json")
+        print("💾 State saved.")
+        return True
+    except Exception as e:
+        print("❌ save_state error:", e)
+        return False
 
-def load_state():
-    """Load auction state safely from Supabase JSON file."""
+def load_state(force_reload=False):
+    """Load auction state from Supabase once, unless forced."""
+    global team_state
+    if team_state and not force_reload:
+        return team_state
+
     data = get_object(STATE_JSON)
     if not data:
-        print("⚠️  No auction_state.json found, creating fresh state.")
-        return {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+        print("⚠️ No auction_state.json found. Creating fresh.")
+        team_state = {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+        save_state()
+        return team_state
 
-    global team_state
     try:
         payload = json.loads(data.decode("utf-8"))
         ts = payload.get("team_state", {})
-        # ensure structure for all teams
         for name in TEAM_NAMES:
             ts.setdefault(name, {"left": BUDGET, "players": []})
-        cc = payload.get("current_card", {})
-        current_card.update({
-            "player": cc.get("player"),
-            "name": cc.get("name"),
-            "image_key": cc.get("image_key"),
-        })
-        print(f"✅ Loaded auction state with {sum(len(t['players']) for t in ts.values())} assigned players.")
+        current_card.update(payload.get("current_card", {}))
+        team_state = ts
+        print(f"✅ Loaded state: {sum(len(v['players']) for v in ts.values())} players assigned.")
         return ts
     except Exception as e:
-        # keep previous state instead of wiping
-        print("⚠️  State load error, keeping previous state:", e)
-        return team_state or {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+        print("⚠️ load_state error:", e)
+        team_state = {name: {"left": BUDGET, "players": []} for name in TEAM_NAMES}
+        return team_state
 
 def reconcile_team_state(new_team_names):
     global team_state
@@ -409,44 +417,21 @@ import json, time
 _state_cache = None  # keep with your other caches
 
 def reset_auction_state():
-    """Completely reset the auction — both Supabase and local memory caches."""
-    global _state_cache, team_state, _df_players_cache, _team_df_cache, current_card
-
+    """Fully clear both memory and Supabase state."""
+    global team_state, current_card, _state_cache
     print("⚠️ Resetting auction state...")
 
-    # Build a fresh empty state structure
-    fresh = {
-        "version": 1,
-        "reset_ts": int(time.time()),
-        "next_player": 1,
-        "sales": [],
-        "assignments": {},
-        "teams": {t: {"players": [], "spent": 0, "balance": BUDGET} for t in TEAM_NAMES},
-    }
-
-    # Overwrite the Supabase JSON file
-    data = json.dumps({
-        "budget": BUDGET,
-        "team_state": {t: {"left": BUDGET, "players": []} for t in TEAM_NAMES},
-        "current_card": {"player": None, "name": None, "image_key": None},
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-    ok = put_object(STATE_JSON, data, "application/json")
-
-    # Clear all memory caches
-    _state_cache = None
-    _df_players_cache = None
-    _team_df_cache = None
-    current_card = {"player": None, "name": None, "image_key": None}
     team_state = {t: {"left": BUDGET, "players": []} for t in TEAM_NAMES}
+    current_card = {"player": None, "name": None, "image_key": None}
+    _state_cache = None
 
+    ok = save_state()
     if ok:
-        print("✅ Auction state fully reset.")
+        print("✅ Auction reset successful.")
     else:
-        print("❌ Failed to overwrite auction_state.json")
-
+        print("❌ Failed to reset auction state.")
     return ok
+
 
 # Load teams, then state, then reconcile
 TEAM_NAMES = load_team_names(default_if_missing=True)
