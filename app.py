@@ -837,22 +837,36 @@ def main():
 
 @app.route("/assign", methods=["POST"])
 def assign():
-    if not _authed(): return redirect(url_for("login"))
-    team  = request.form.get("team")
-    amount= int(request.form.get("amount", 0))
-    player= request.form.get("player")
-    if team not in team_state or not player: return redirect(url_for("main"))
+    if not _authed():
+        return redirect(url_for("login"))
+
+    team = request.form.get("team")
+    amount = int(request.form.get("amount", 0))
+    player = request.form.get("player")
+
+    if team not in team_state or not player:
+        return redirect(url_for("main"))
+
     num = int(player)
     pname = get_player_name(num)
     display = f"{num}_{pname}"
+
     if amount > team_state[team]["left"]:
         return f"<h3 style='color:red'>Not enough budget in {team}. <a href='{url_for('main')}'>Back</a></h3>"
+
     idx = len(team_state[team]["players"]) + 1
-    team_state[team]["players"].append({"idx": idx, "name": display, "prize": amount, "player_num": num})
+    team_state[team]["players"].append({
+        "idx": idx,
+        "name": display,
+        "prize": amount,
+        "player_num": num
+    })
     team_state[team]["left"] -= amount
+
     save_state()
-    team_state = load_state(force_reload=True)   # <— add this line
-	return redirect(url_for("main", player=player))
+    team_state = load_state(force_reload=True)
+
+    return redirect(url_for("main", player=player))
 
 @app.route("/undo", methods=["POST"])
 def undo():
