@@ -425,22 +425,21 @@ def reset_auction_state():
     current_card = {"player": None, "name": None, "image_key": None}
     _state_cache = None
 
-    ok = save_state()
+    ok = save_state()  # overwrite cloud JSON with clean state
     if ok:
         print("✅ Auction reset successful.")
     else:
         print("❌ Failed to reset auction state.")
     return ok
 
-
 # Load teams, then state, then reconcile
 # Initialize globals before first load
 team_state = {}   # declare first to avoid NameError
 current_card = {"player": None, "name": None, "image_key": None}
 TEAM_NAMES = load_team_names(default_if_missing=True)
-team_state = load_state()  # now safe to call
-reconcile_team_state(TEAM_NAMES)
-
+team_state = {t: {"left": BUDGET, "players": []} for t in TEAM_NAMES}
+current_card = {"player": None, "name": None, "image_key": None}
+save_state()  # optional: starts with a fresh blank file
 
 def _reindex_team(team_name: str):
     players = team_state[team_name]["players"]
