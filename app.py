@@ -812,14 +812,14 @@ def main():
         current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
 	
     html = render_template_string(
-    	TEMPLATE,
-    	player=player, player_name=player_name, image_url=image_url,
-    	team_names=TEAM_NAMES, team_state=team_state,
-    	max_image_num=MAX_IMAGE_NUM, budget=BUDGET
-	)
-	resp = make_response(html)
-	resp.headers["Cache-Control"] = "no-store"
-	return resp
+        TEMPLATE,
+        player=player, player_name=player_name, image_url=image_url,
+        team_names=TEAM_NAMES, team_state=team_state,
+        max_image_num=MAX_IMAGE_NUM, budget=BUDGET
+    )
+    resp = make_response(html)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/assign", methods=["POST"])
