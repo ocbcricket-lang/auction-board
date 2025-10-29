@@ -368,9 +368,9 @@ def save_state():
             "current_card": current_card,
             "saved_at": datetime.now().isoformat(timespec="seconds")
         }
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        put_object(STATE_JSON, data, "application/json")
-        time.sleep(0.2)
+    	data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    	put_object(STATE_JSON, data, "application/json")
+    	time.sleep(0.2)
         print("💾 State saved.")
         return True
     except Exception as e:
@@ -407,12 +407,12 @@ def load_state(force_reload=False):
 def reconcile_team_state(new_team_names):
     global team_state
     for name in new_team_names:
-        team_state.setdefault(name, {"left": BUDGET, "players": []})
-    try:
-        pass #save_state()
+    	team_state.setdefault(name, {"left": BUDGET, "players": []})
+	try:
+    	pass #save_state()
     except Exception as e:
         # Avoid failing the whole deploy if bucket/creds arent ready yet
-        print("Startup save_state skipped:", e)
+    	print("Startup save_state skipped:", e)
 import json, time
 
 _state_cache = None  # keep with your other caches
@@ -809,14 +809,9 @@ def main():
         except:
             pass
     if player is not None:
-        current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
+    	current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
 	
-    html = render_template_string(
-        TEMPLATE,
-        player=player, player_name=player_name, image_url=image_url,
-        team_names=TEAM_NAMES, team_state=team_state,
-        max_image_num=MAX_IMAGE_NUM, budget=BUDGET
-    )
+	html = render_template_string(TEMPLATE, player=player, player_name=player_name, image_url=image_url, team_names=TEAM_NAMES, team_state=team_state, max_image_num=MAX_IMAGE_NUM, budget=BUDGET)
     resp = make_response(html)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -856,7 +851,7 @@ def undo():
                 _reindex_team(team)
                 save_state()
 				team_state = load_state(force_reload=True)
-                return redirect(url_for("main", player=target))
+            	return redirect(url_for("main", player=target))
     return redirect(url_for("main", player=raw))
 
 @app.route("/view")
