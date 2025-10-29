@@ -370,6 +370,7 @@ def save_state():
         }
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         put_object(STATE_JSON, data, "application/json")
+		time.sleep(0.2)
         print("💾 State saved.")
         return True
     except Exception as e:
@@ -809,12 +810,17 @@ def main():
             pass
     if player is not None:
         current_card.update({"player": player, "name": player_name, "image_key": key if image_url else None})
+	
+    html = render_template_string(
+    	TEMPLATE,
+    	player=player, player_name=player_name, image_url=image_url,
+    	team_names=TEAM_NAMES, team_state=team_state,
+    	max_image_num=MAX_IMAGE_NUM, budget=BUDGET
+	)
+	resp = make_response(html)
+	resp.headers["Cache-Control"] = "no-store"
+	return resp
 
-    return render_template_string(
-        TEMPLATE,
-        player=player, player_name=player_name, image_url=image_url,
-        team_names=TEAM_NAMES, team_state=team_state, max_image_num=MAX_IMAGE_NUM, budget=BUDGET
-    )
 
 @app.route("/assign", methods=["POST"])
 def assign():
@@ -832,7 +838,8 @@ def assign():
     team_state[team]["players"].append({"idx": idx, "name": display, "prize": amount, "player_num": num})
     team_state[team]["left"] -= amount
     save_state()
-    return redirect(url_for("main", player=player))
+	team_state = load_state(force_reload=True)   # <— add this line
+	return redirect(url_for("main", player=player))
 
 @app.route("/undo", methods=["POST"])
 def undo():
@@ -848,6 +855,7 @@ def undo():
                 state["players"].pop(i)
                 _reindex_team(team)
                 save_state()
+				team_state = load_state(force_reload=True)
                 return redirect(url_for("main", player=target))
     return redirect(url_for("main", player=raw))
 
