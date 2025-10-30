@@ -847,7 +847,6 @@ def main():
     return resp
 
 @app.route("/assign", methods=["POST"])
-@app.route("/assign", methods=["POST"])
 def assign():
     if not _authed():
         return redirect(url_for("login"))
@@ -886,8 +885,11 @@ def assign():
     save_state()
     time.sleep(0.5)
 
-    # ⚠️ Don't reload immediately — redirect triggers /main, which reloads cleanly
-    return redirect(url_for("main", player=player))
+    # ✅ Instantly refresh the board after assignment
+    return f"""
+    <meta http-equiv="refresh" content="0;url={url_for('main', player=player)}">
+    <h3 style='text-align:center;color:green;'>Player assigned successfully. Redirecting...</h3>
+    """
 
 @app.route("/undo", methods=["POST"])
 def undo():
