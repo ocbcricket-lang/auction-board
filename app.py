@@ -886,10 +886,20 @@ def assign():
     time.sleep(0.5)
 
     # ✅ Instantly refresh the board after assignment
+        save_state()
+    time.sleep(0.5)
+
+    # 🔄 Wait 1 second, then reload /main quietly (no message shown)
     return f"""
-    <meta http-equiv="refresh" content="0;url={url_for('main', player=player)}">
-    <h3 style='text-align:center;color:green;'>Player assigned successfully. Redirecting...</h3>
+    <html><head>
+      <script>
+        setTimeout(function() {{
+          window.location.href = "{url_for('main', player=player)}";
+        }}, 2000);  // wait 1 second (2000 ms)
+      </script>
+    </head><body></body></html>
     """
+
 
 @app.route("/undo", methods=["POST"])
 def undo():
