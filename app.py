@@ -841,9 +841,14 @@ def assign():
     if not _authed():
         return redirect(url_for("login"))
 
+    global team_state  # ✅ Fix 1: declare global
     team = request.form.get("team")
     amount = int(request.form.get("amount", 0))
     player = request.form.get("player")
+
+    # Ensure team_state is loaded
+    if not team_state:
+        team_state = load_state(force_reload=True)
 
     if team not in team_state or not player:
         return redirect(url_for("main"))
@@ -852,6 +857,7 @@ def assign():
     pname = get_player_name(num)
     display = f"{num}_{pname}"
 
+    # ✅ Fix 2: prevent negative balance
     if amount > team_state[team]["left"]:
         return f"<h3 style='color:red'>Not enough budget in {team}. <a href='{url_for('main')}'>Back</a></h3>"
 
@@ -865,19 +871,26 @@ def assign():
     team_state[team]["left"] -= amount
 
     save_state()
-    team_state = load_state(force_reload=True)
+    team_state = load_state(force_reload=True)  # ✅ Fix 3: refresh after saving
 
     return redirect(url_for("main", player=player))
+
 
 @app.route("/undo", methods=["POST"])
 def undo():
     if not _authed():
         return redirect(url_for("login"))
+    global team_state  # ✅ Fix 1: declare global
+
     raw = (request.form.get("player") or "").strip()
     try:
         target = int(raw)
     except:
         return redirect(url_for("main"))
+
+    if not team_state:
+        team_state = load_state(force_reload=True)
+
     for team, state in team_state.items():
         for i, p in enumerate(list(state["players"])):
             match = (
@@ -892,6 +905,7 @@ def undo():
                 team_state = load_state(force_reload=True)
                 return redirect(url_for("main", player=target))
     return redirect(url_for("main", player=raw))
+
 
 @app.route("/view")
 def view():
