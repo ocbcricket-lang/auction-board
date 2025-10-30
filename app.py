@@ -984,6 +984,9 @@ current_card = {"player": None, "name": None, "image_key": None}
 TEAM_NAMES = load_team_names(default_if_missing=True)
 team_state = load_state(force_reload=True)
 
-# Local dev
+# Local dev + Render deploy safe
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))  # use Render's assigned port if available
+    app.run(host="0.0.0.0", port=port)
+
