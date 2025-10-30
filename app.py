@@ -7,7 +7,8 @@ from flask import (
 )
 from flask import redirect, url_for, flash
 from supabase import create_client, Client  # pip install supabase
-
+import threading
+_state_lock = threading.Lock()
 # ---------- CONFIG ----------
 BUDGET = 10_000
 IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
@@ -361,21 +362,21 @@ def find_image_key(num: int) -> str|None:
 
 def save_state():
     """Persist in-memory state to Supabase."""
-    try:
-        payload = {
-            "budget": BUDGET,
-            "team_state": team_state,
-            "current_card": current_card,
-            "saved_at": datetime.now().isoformat(timespec="seconds")
-        }
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        put_object(STATE_JSON, data, "application/json")
-        time.sleep(0.2)
-        print("💾 State saved.")
-        return True
-    except Exception as e:
-        print("❌ save_state error:", e)
-        return False
+    with _state_lock:
+        try:
+            payload = {...}
+            data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ok = put_object(STATE_JSON, data, "application/json")
+            if ok:
+                time.sleep(1.0)
+                print("✅ State saved safely.")
+            else:
+                print("⚠️ save_state failed upload.")
+            return ok
+        except Exception as e:
+            print("? save_state error:", e)
+            return False
+
 
 def load_state(force_reload=False):
     """Load auction state from Supabase Storage JSON file."""
@@ -837,30 +838,32 @@ def main():
     return resp
 
 @app.route("/assign", methods=["POST"])
+@app.route("/assign", methods=["POST"])
 def assign():
     if not _authed():
         return redirect(url_for("login"))
 
-    global team_state  # ✅ Fix 1: declare global
+    global team_state  # ensure we modify the shared state
+
     team = request.form.get("team")
     amount = int(request.form.get("amount", 0))
     player = request.form.get("player")
 
-    # Ensure team_state is loaded
-    if not team_state:
-        team_state = load_state(force_reload=True)
+    # ✅ Always ensure we are using the latest cloud state before modification
+    team_state = load_state(force_reload=True)
 
-    if team not in team_state or not player:
+    if not team or not player or team not in team_state:
         return redirect(url_for("main"))
 
     num = int(player)
     pname = get_player_name(num)
     display = f"{num}_{pname}"
 
-    # ✅ Fix 2: prevent negative balance
+    # ✅ Check available balance
     if amount > team_state[team]["left"]:
         return f"<h3 style='color:red'>Not enough budget in {team}. <a href='{url_for('main')}'>Back</a></h3>"
 
+    # ✅ Add new player entry
     idx = len(team_state[team]["players"]) + 1
     team_state[team]["players"].append({
         "idx": idx,
@@ -870,17 +873,19 @@ def assign():
     })
     team_state[team]["left"] -= amount
 
+    # ✅ Save safely and allow slight sync delay
     save_state()
-    team_state = load_state(force_reload=True)  # ✅ Fix 3: refresh after saving
+    time.sleep(0.5)
 
+    # ⚠️ Don't reload immediately — redirect triggers /main, which reloads cleanly
     return redirect(url_for("main", player=player))
-
 
 @app.route("/undo", methods=["POST"])
 def undo():
     if not _authed():
         return redirect(url_for("login"))
-    global team_state  # ✅ Fix 1: declare global
+
+    global team_state  # ✅ Ensure global to avoid UnboundLocalError
 
     raw = (request.form.get("player") or "").strip()
     try:
@@ -888,23 +893,35 @@ def undo():
     except:
         return redirect(url_for("main"))
 
+    # ✅ Ensure latest state before undo
     if not team_state:
         team_state = load_state(force_reload=True)
 
+    # ✅ Iterate safely over all teams
     for team, state in team_state.items():
-        for i, p in enumerate(list(state["players"])):
+        for i, p in enumerate(list(state["players"])):  # make a copy to modify safely
             match = (
                 p.get("player_num") == target
                 or (isinstance(p.get("name"), str) and p["name"].startswith(f"{target}_"))
             )
             if match:
+                # Restore amount and remove player
                 state["left"] += int(p.get("prize", 0))
                 state["players"].pop(i)
                 _reindex_team(team)
+
+                # ✅ Save the state safely and don't reload immediately
                 save_state()
-                team_state = load_state(force_reload=True)
+
+                # ✅ Optional: small delay for Supabase consistency
+                time.sleep(0.5)
+
+                # ✅ Let main() reload fresh state after redirect
                 return redirect(url_for("main", player=target))
+
+    # If no match found, just reload normally
     return redirect(url_for("main", player=raw))
+
 
 
 @app.route("/view")
