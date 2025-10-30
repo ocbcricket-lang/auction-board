@@ -361,22 +361,31 @@ def find_image_key(num: int) -> str|None:
     return None
 
 def save_state():
-    """Persist in-memory state to Supabase."""
+    """Persist in-memory state to Supabase safely (auto-handle sets)."""
     with _state_lock:
         try:
-            payload = {...}
-            data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            def safe_convert(obj):
+                if isinstance(obj, set):
+                    return list(obj)
+                raise TypeError(f"Type {type(obj)} not serializable")
+
+            payload = {
+                "budget": BUDGET,
+                "team_state": team_state,
+                "current_card": current_card,
+                "saved_at": datetime.now().isoformat(timespec="seconds")
+            }
+            data = json.dumps(payload, default=safe_convert, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             ok = put_object(STATE_JSON, data, "application/json")
             if ok:
                 time.sleep(1.0)
-                print("✅ State saved safely.")
+                print("✅ State saved successfully.")
             else:
-                print("⚠️ save_state failed upload.")
+                print("⚠️ save_state upload failed.")
             return ok
         except Exception as e:
             print("? save_state error:", e)
             return False
-
 
 def load_state(force_reload=False):
     """Load auction state from Supabase Storage JSON file."""
