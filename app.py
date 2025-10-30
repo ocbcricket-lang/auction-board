@@ -847,31 +847,30 @@ def main():
     return resp
 
 @app.route("/assign", methods=["POST"])
+@app.route("/assign", methods=["POST"])
 def assign():
     if not _authed():
         return redirect(url_for("login"))
 
-    global team_state  # ensure we modify the shared state
-
+    global team_state
     team = request.form.get("team")
     amount = int(request.form.get("amount", 0))
     player = request.form.get("player")
 
-    # ✅ Always ensure we are using the latest cloud state before modification
-    team_state = load_state(force_reload=True)
+    # Ensure latest state before modification
+    if not team_state:
+        team_state = load_state(force_reload=True)
 
-    if not team or not player or team not in team_state:
+    if team not in team_state or not player:
         return redirect(url_for("main"))
 
     num = int(player)
     pname = get_player_name(num)
     display = f"{num}_{pname}"
 
-    # ✅ Check available balance
     if amount > team_state[team]["left"]:
         return f"<h3 style='color:red'>Not enough budget in {team}. <a href='{url_for('main')}'>Back</a></h3>"
 
-    # ✅ Add new player entry
     idx = len(team_state[team]["players"]) + 1
     team_state[team]["players"].append({
         "idx": idx,
@@ -881,25 +880,19 @@ def assign():
     })
     team_state[team]["left"] -= amount
 
-    # ✅ Save safely and allow slight sync delay
     save_state()
     time.sleep(0.5)
 
-    # ✅ Instantly refresh the board after assignment
-        save_state()
-    time.sleep(0.5)
-
-    # 🔄 Wait 1 second, then reload /main quietly (no message shown)
+    # ✅ Wait 1 second silently, then auto-reload /main
     return f"""
-    <html><head>
-      <script>
-        setTimeout(function() {{
-          window.location.href = "{url_for('main', player=player)}";
-        }}, 2000);  // wait 1 second (2000 ms)
-      </script>
-    </head><body></body></html>
-    """
-
+<html><head>
+<script>
+setTimeout(function() {{
+  window.location.href = "{url_for('main', player=player)}";
+}}, 1000);
+</script>
+</head><body></body></html>
+"""
 
 @app.route("/undo", methods=["POST"])
 def undo():
